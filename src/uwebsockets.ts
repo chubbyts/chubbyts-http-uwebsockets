@@ -150,10 +150,13 @@ const getBody = (
     }
   };
 
+  // no limit configured: the comparisons below never match
+  const maxBytes = requestBodyMaxBytes ?? Infinity;
+
   const maxBytesError = (): Error => new Error(`Request body exceeds the maximum of ${requestBodyMaxBytes} bytes`);
 
   // uWebSockets.js does not limit the body size itself: a declared too large body gets rejected before reading it
-  if (requestBodyMaxBytes !== undefined && Number(contentLength) > requestBodyMaxBytes) {
+  if (Number(contentLength) > maxBytes) {
     failBody(maxBytesError());
 
     return passthrough;
@@ -177,7 +180,7 @@ const getBody = (
     received.bytes += chunk.byteLength;
 
     // a chunked body (or one with a wrong content-length) is limited while receiving it
-    if (requestBodyMaxBytes !== undefined && received.bytes > requestBodyMaxBytes) {
+    if (received.bytes > maxBytes) {
       clearTimeout(timeout);
       failBody(maxBytesError());
 

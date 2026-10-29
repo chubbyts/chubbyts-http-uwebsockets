@@ -915,6 +915,7 @@ describe('uwebsockets', () => {
       [{ reasonPhrase: 'OK\r\nContent-Length: 0\r\n\r\nHTTP/1.1 200 OK' }, 'Invalid response reason phrase'],
       [{ headers: { 'x-echo': ['a\r\nx-injected: pwned'] } }, 'Invalid response header "x-echo"'],
       [{ headers: { 'x-echo': ['a\0'] } }, 'Invalid response header "x-echo"'],
+      [{ headers: { 'x-echo': ['valid', 'a\0'] } }, 'Invalid response header "x-echo"'],
       [{ headers: { 'x-echo\r\nx-injected': ['pwned'] } }, 'Invalid response header "x-echo\r\nx-injected"'],
       [{ headers: { 'x echo': ['value'] } }, 'Invalid response header "x echo"'],
       [{ headers: { '': ['value'] } }, 'Invalid response header ""'],
@@ -935,6 +936,39 @@ describe('uwebsockets', () => {
       ).toThrow(expected);
 
       expect(body.destroyed).toBe(true);
+
+      expect(uWebSocketsResponseMocks).toHaveLength(0);
+    });
+
+    test.each([
+      [100, 'Continue'],
+      [999, 'Custom'],
+    ])('with valid response status %d', async (status, reasonPhrase) => {
+      const handlers: Handlers = {};
+
+      const ended = Promise.withResolvers<undefined>();
+
+      const [uWebSocketsResponse, uWebSocketsResponseMocks] = useObjectMock<HttpResponse>([
+        onAbortedMock(handlers, (): HttpResponse => uWebSocketsResponse),
+        corkMock((): HttpResponse => uWebSocketsResponse),
+        { name: 'writeStatus', parameters: [`${status} ${reasonPhrase}`], returnSelf: true },
+        corkMock((): HttpResponse => uWebSocketsResponse),
+        {
+          name: 'end',
+          callback: (): HttpResponse => {
+            ended.resolve(undefined);
+
+            return uWebSocketsResponse;
+          },
+        },
+      ]);
+
+      createResponseToUWebSocketsResponseEmitter()(
+        createResponse({ status, reasonPhrase, body: Readable.from([]) }),
+        uWebSocketsResponse,
+      );
+
+      await ended.promise;
 
       expect(uWebSocketsResponseMocks).toHaveLength(0);
     });
@@ -1014,6 +1048,10 @@ describe('uwebsockets', () => {
 
       // no timeout gets started (a close call would fail with a missing mock)
       await wait(100);
+
+      // the ended body does not get streamed
+      expect(body.listenerCount('data')).toBe(0);
+      expect(body.listenerCount('end')).toBe(0);
 
       expect(uWebSocketsResponseMocks).toHaveLength(0);
     });

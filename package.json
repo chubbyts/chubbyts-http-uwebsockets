@@ -1,0 +1,70 @@
+{
+  "name": "@chubbyts/chubbyts-http-uwebsockets",
+  "type": "module",
+  "version": "1.0.0",
+  "description": "Use @chubbyts/chubbyts-http-types on uwebsockets.",
+  "keywords": [
+    "chubbyts",
+    "http",
+    "uwebsockets",
+    "server-request",
+    "response",
+    "bridge"
+  ],
+  "author": "Dominik Zogg",
+  "license": "MIT",
+  "repository": "chubbyts/chubbyts-http-uwebsockets",
+  "scripts": {
+    "build": "rm -Rf dist && tsc",
+    "cs-fix": "prettier --write src tests",
+    "cs": "prettier --check src tests",
+    "infection": "stryker run",
+    "lint-fix": "oxlint --fix src tests vitest.config.ts vitest.integration.config.ts vitest.integration.setup.ts",
+    "lint": "oxlint src tests vitest.config.ts vitest.integration.config.ts vitest.integration.setup.ts",
+    "prepare": "pnpm run build",
+    "test": "vitest",
+    "test:integration": "vitest --config vitest.integration.config.ts"
+  },
+  "prettier": {
+    "printWidth": 120,
+    "tabWidth": 2,
+    "singleQuote": true,
+    "trailingComma": "all"
+  },
+  "files": [
+    "dist"
+  ],
+  "exports": {
+    "./*": {
+      "types": "./dist/*.d.ts",
+      "import": "./dist/*.js",
+      "default": "./dist/*.js"
+    }
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@chubbyts/chubbyts-http-types": "^4.0.0",
+    "uWebSockets.js": "github:uNetworking/uWebSockets.js#v20.67.0"
+  },
+  "devDependencies": {
+    "@chubbyts/chubbyts-function-mock": "^2.3.1",
+    "@chubbyts/chubbyts-http": "^3.0.0",
+    "@chubbyts/chubbyts-oxlint": "^1.0.2",
+    "@stryker-mutator/core": "^10.0.0",
+    "@stryker-mutator/vitest-runner": "^10.0.0",
+    "@types/node": "^26.6.5",
+    "@vitest/coverage-v8": "^4.1.12",
+    "cross-fetch": "^4.1.0",
+    "oxlint": "^1.89.0",
+    "prettier": "^3.9.10",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.12"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "packageManager": "pnpm@11.28.6+sha512.55d90390c3b39042f1505a2697789f0256c6d95bb28bdd7cb731af1887c9f2629ef581acb9f4e4ec772024c8203c2aed22a03299b97103fdcf32668e905d0024"
+}

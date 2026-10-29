@@ -1,0 +1,10 @@
+allowBuilds:
+  esbuild: true
+  unrs-resolver: true
+minimumReleaseAgeExclude:
+  - '@chubbyts/chubbyts-http-types@4.0.0'
+  - '@chubbyts/chubbyts-http@3.0.0'
+packageExtensions:
+  '@stryker-mutator/core':
+    dependencies:
+      typescript: ^6.0.3

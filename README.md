@@ -37,7 +37,7 @@ injected `UriFactory`, `ServerRequestFactory` and `RequestHelpers` (or `ServerRe
 Through [NPM](https://www.npmjs.com) as [@chubbyts/chubbyts-http-uwebsockets][1].
 
 ```sh
-npm i @chubbyts/chubbyts-http-uwebsockets@^1.0.0
+npm i @chubbyts/chubbyts-http-uwebsockets@^1.0.1
 ```
 
 ## Usage
@@ -154,7 +154,8 @@ uWebSockets.js does not limit the size of a request body:
  * `createUWebSocketsRequestToServerRequestFactory(uriFactory, serverRequestFactory, requestHelpers, baseUrl, requestBodyTimeoutMs, requestBodyMaxBytes)`:
    a request body with a `content-length` above the given limit does not get read at all, a body exceeding it while
    being received (e.g. chunked) gets stopped. In both cases the connection gets closed and the error surfaces to
-   the handler while iterating the body.
+   the handler while iterating the body. The limit must be a non-negative number (`NaN` would silently disable it),
+   otherwise the factory throws.
 
 The limit is optional and disabled by default. They only cover the body phases handled by this adapter,
 slow header senders are covered by the idle timeout uWebSockets.js applies to HTTP connections itself.

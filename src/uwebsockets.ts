@@ -221,6 +221,12 @@ export const createUWebSocketsRequestToServerRequestFactory = (
   requestBodyTimeoutMs: number | undefined = undefined,
   requestBodyMaxBytes: number | undefined = undefined,
 ): UWebSocketsRequestToServerRequestFactory => {
+  // fail fast: NaN would silently disable the limit (every comparison with it is false), a negative limit would
+  // reject every body (even an empty one)
+  if (Number.isNaN(requestBodyMaxBytes) || (requestBodyMaxBytes ?? 0) < 0) {
+    throw new Error(`Request body max bytes "${requestBodyMaxBytes}" must be a non-negative number`);
+  }
+
   const resolveRequestUrl = createUrlResolver(baseUrl);
 
   return (uWebSocketsRequest: HttpRequest, uWebSocketsResponse: HttpResponse): ServerRequest => {

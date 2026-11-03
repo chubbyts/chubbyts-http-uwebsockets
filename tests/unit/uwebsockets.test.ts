@@ -800,6 +800,49 @@ describe('uwebsockets', () => {
       expect(uWebSocketsResponseMocks).toHaveLength(0);
       expectAllMocksCalled(mocks);
     });
+
+    test.each([NaN, -1, -0.5, -Infinity])('with invalid request body max bytes %s', (requestBodyMaxBytes) => {
+      const [uriFactory, uriFactoryMocks] = useFunctionMock<UriFactory>([]);
+      const [serverRequestFactory, serverRequestFactoryMocks] = useFunctionMock<ServerRequestFactory>([]);
+      const [requestHelpers, requestHelpersMocks] = useObjectMock<RequestHelpers>([]);
+
+      expect(() =>
+        createUWebSocketsRequestToServerRequestFactory(
+          uriFactory,
+          serverRequestFactory,
+          requestHelpers,
+          undefined,
+          undefined,
+          requestBodyMaxBytes,
+        ),
+      ).toThrow(`Request body max bytes "${requestBodyMaxBytes}" must be a non-negative number`);
+
+      expect(uriFactoryMocks).toHaveLength(0);
+      expect(serverRequestFactoryMocks).toHaveLength(0);
+      expect(requestHelpersMocks).toHaveLength(0);
+    });
+
+    // accepted before the validation got added: kept for backward compatibility
+    test.each([0, 1.5, Infinity])('with valid request body max bytes %s', (requestBodyMaxBytes) => {
+      const [uriFactory, uriFactoryMocks] = useFunctionMock<UriFactory>([]);
+      const [serverRequestFactory, serverRequestFactoryMocks] = useFunctionMock<ServerRequestFactory>([]);
+      const [requestHelpers, requestHelpersMocks] = useObjectMock<RequestHelpers>([]);
+
+      expect(
+        createUWebSocketsRequestToServerRequestFactory(
+          uriFactory,
+          serverRequestFactory,
+          requestHelpers,
+          undefined,
+          undefined,
+          requestBodyMaxBytes,
+        ),
+      ).toBeTypeOf('function');
+
+      expect(uriFactoryMocks).toHaveLength(0);
+      expect(serverRequestFactoryMocks).toHaveLength(0);
+      expect(requestHelpersMocks).toHaveLength(0);
+    });
   });
 
   describe('createResponseToUWebSocketsResponseEmitter', () => {

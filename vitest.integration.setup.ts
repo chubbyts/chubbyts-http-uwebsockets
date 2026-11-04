@@ -33,7 +33,7 @@ const startServer = async () => {
       await fetch(`http://${testServerHost}:${testServerPort}`);
       return child;
     } catch (e) {
-      if (e.code === 'ECONNREFUSED') {
+      if ((e as NodeJS.ErrnoException).code === 'ECONNREFUSED') {
         console.log('wait for test server to be up and running...');
         await new Promise((resolve) => setTimeout(resolve, iterationTimeout));
       } else {

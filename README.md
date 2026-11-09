@@ -29,7 +29,7 @@ injected `UriFactory`, `ServerRequestFactory` and `RequestHelpers` (or `ServerRe
 ## Requirements
 
  * node: 22
- * [@chubbyts/chubbyts-http-types][2]: ^4.0.0
+ * [@chubbyts/chubbyts-http-types][2]: ^4.3.0
  * [uWebSockets.js][4]: v20.67.0
 
 ## Installation
@@ -37,7 +37,7 @@ injected `UriFactory`, `ServerRequestFactory` and `RequestHelpers` (or `ServerRe
 Through [NPM](https://www.npmjs.com) as [@chubbyts/chubbyts-http-uwebsockets][1].
 
 ```sh
-npm i @chubbyts/chubbyts-http-uwebsockets@^1.0.1
+npm i @chubbyts/chubbyts-http-uwebsockets@^1.1.0
 ```
 
 ## Usage
@@ -111,7 +111,8 @@ App()
 ### Server request
 
 The server request gets created by `serverRequestFactory(method, uriFactory(url))`, then `withProtocolVersion`,
-`withSignal`, `withHeader` (for each header) and, except for `GET` and `HEAD`, `withBody` get applied:
+`withSignal`, `withHeaders` (all headers at once, or `withHeader` for each header if the implementation does not
+provide the optional `withHeaders`) and, except for `GET` and `HEAD`, `withBody` get applied:
 
  * the url gets built from the base url (scheme, host, port and path prefix) and the origin-form request target.
    Request targets in another form get rejected.
@@ -130,6 +131,14 @@ The status, the reason phrase and the headers get validated before anything is w
 (e.g. CR / LF, which would allow response splitting) lets the emitter throw, after cancelling the body. The same
 applies to an already destroyed node stream body. As nothing has been sent yet, the caller is able to respond with an
 error (see the usage example).
+
+uWebSockets.js frames the response itself: `content-length` and `transfer-encoding` headers set by the handler do
+not get written, they would end up duplicated or conflicting (`content-length` next to `chunked`), which lets a proxy
+and the client disagree about where the response ends (request smuggling).
+
+The response to a `HEAD` request and a `1xx`, `204` or `304` response never get a body (RFC 9112 6.3), the body of
+the response gets cancelled instead, any byte sent would be read as the start of the next response. For `HEAD` and
+`304` a single valid `content-length` of the handler gets reported (the size of the `GET` response, RFC 9110 8.6).
 
 The body gets streamed with backpressure. A node stream body is used as is and a web stream body gets converted with
 `Readable.fromWeb`, so both get stopped (destroyed / cancelled) when the client disconnects, even while a read is

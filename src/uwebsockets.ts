@@ -18,6 +18,17 @@ const protocolVersion = '1.1';
 const tokenPattern = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
 const fieldValuePattern = /^[\t\x20-\x7e\x80-\xff]*$/;
 
+// uWebSockets.js writes the framing headers itself (content-length, or transfer-encoding chunked while streaming):
+// ones set by the handler would end up duplicated or conflicting (content-length next to chunked), letting a proxy
+// and the client disagree about where the response ends (request smuggling, RFC 9112 6.1 and 6.3)
+const framingHeaderNames = new Set(['content-length', 'transfer-encoding']);
+
+// RFC 9110 8.6: a content-length announces the size of a GET response for HEAD or 304, a decimal number
+const contentLengthPattern = /^\d+$/;
+
+// the emitter does not know the request: the request factory flags the responses of HEAD requests
+const headResponses = new WeakSet<HttpResponse>();
+
 type AbortState = { aborted: boolean; listeners: Array<() => void> };
 
 const abortStates = new WeakMap<HttpResponse, AbortState>();
@@ -229,12 +240,21 @@ export const createUWebSocketsRequestToServerRequestFactory = (
 
   const resolveRequestUrl = createUrlResolver(baseUrl);
 
+  // optional (chubbyts-http-types 4.3): sets all headers copying the server request once, withHeader would copy it
+  // (with all headers set so far) once per header; resolved once, the helpers do not change
+  const withHeaders = requestHelpers.withHeaders?.bind(requestHelpers);
+
   return (uWebSocketsRequest: HttpRequest, uWebSocketsResponse: HttpResponse): ServerRequest => {
     const method = uWebSocketsRequest.getMethod().toUpperCase();
     const headers = uWebSocketsRequestToHeaders(uWebSocketsRequest);
     const uri = uriFactory(resolveRequestUrl(uWebSocketsRequest));
 
     const abortState = getAbortState(uWebSocketsResponse);
+
+    if (method === 'HEAD') {
+      // oxlint-disable-next-line functional/immutable-data
+      headResponses.add(uWebSocketsResponse);
+    }
 
     const abortController = new AbortController();
 
@@ -245,10 +265,15 @@ export const createUWebSocketsRequestToServerRequestFactory = (
     // created and changed through the injected implementation only: the bridge works with any of them
     const createdServerRequest = requestHelpers.withProtocolVersion(serverRequestFactory(method, uri), protocolVersion);
 
-    const serverRequest = [...headers].reduce(
-      (request, [name, values]) => requestHelpers.withHeader(request, name, values),
-      requestHelpers.withSignal(createdServerRequest, abortController.signal),
-    );
+    const serverRequestWithSignal = requestHelpers.withSignal(createdServerRequest, abortController.signal);
+
+    // Object.fromEntries defines own properties: a header named '__proto__' does not change the prototype
+    const serverRequest = withHeaders
+      ? withHeaders(serverRequestWithSignal, Object.fromEntries(headers))
+      : [...headers].reduce(
+          (request, [name, values]) => requestHelpers.withHeader(request, name, values),
+          serverRequestWithSignal,
+        );
 
     // the body of a GET or HEAD request gets ignored: the server request keeps the (empty) body of the factory
     if (method === 'GET' || method === 'HEAD') {
@@ -311,6 +336,44 @@ const getInvalidResponseReason = (response: Response): string | undefined => {
   return invalidHeaderName !== undefined ? `Invalid response header "${invalidHeaderName}"` : undefined;
 };
 
+// RFC 9112 6.3: the response to a HEAD request and a 1xx, 204 or 304 response end with the header section, any byte
+// sent as body would be read as the start of the next response
+const hasNoContent = (response: Response, uWebSocketsResponse: HttpResponse): boolean =>
+  headResponses.has(uWebSocketsResponse) || response.status < 200 || response.status === 204 || response.status === 304;
+
+// RFC 9110 8.6: a 1xx or 204 response must not have a content-length, a HEAD or 304 response may announce the one of
+// the GET response, which is taken from the handler if it is a single valid one
+const getReportedContentLength = (response: Response): number | undefined => {
+  if (response.status < 200 || response.status === 204) {
+    return undefined;
+  }
+
+  const values = Object.entries(response.headers).find(([name]) => name.toLowerCase() === 'content-length')?.[1];
+
+  if (values?.length !== 1 || !contentLengthPattern.test(values[0])) {
+    return undefined;
+  }
+
+  const contentLength = Number(values[0]);
+
+  return Number.isSafeInteger(contentLength) ? contentLength : undefined;
+};
+
+const writeStatusAndHeaders = (response: Response, uWebSocketsResponse: HttpResponse): void => {
+  uWebSocketsResponse.writeStatus(`${response.status} ${response.reasonPhrase}`);
+
+  // every value gets its own header line, which is required for set-cookie (RFC 6265 3)
+  Object.entries(response.headers).forEach(([name, values]) => {
+    if (framingHeaderNames.has(name.toLowerCase())) {
+      return;
+    }
+
+    values.forEach((value) => {
+      uWebSocketsResponse.writeHeader(name, value);
+    });
+  });
+};
+
 type ResponseToUWebSocketsResponseEmitter = (response: Response, uWebSocketsResponse: HttpResponse) => void;
 
 export const createResponseToUWebSocketsResponseEmitter = (
@@ -336,6 +399,26 @@ export const createResponseToUWebSocketsResponseEmitter = (
       throw new Error(invalidResponseReason);
     }
 
+    // the body (e.g. of a GET handler also serving HEAD) does not get sent: cancel it like an unsent one
+    if (hasNoContent(response, uWebSocketsResponse)) {
+      cancelBody(response.body);
+
+      const reportedContentLength = getReportedContentLength(response);
+
+      uWebSocketsResponse.cork(() => {
+        writeStatusAndHeaders(response, uWebSocketsResponse);
+
+        // an explicit undefined would make uWebSockets.js report a content-length of 2^63
+        if (reportedContentLength !== undefined) {
+          uWebSocketsResponse.endWithoutBody(reportedContentLength);
+        } else {
+          uWebSocketsResponse.endWithoutBody();
+        }
+      });
+
+      return;
+    }
+
     const body = bodyToReadable(response.body);
 
     // a destroyed (e.g. errored) body does not emit any events anymore: the response would never end
@@ -344,14 +427,7 @@ export const createResponseToUWebSocketsResponseEmitter = (
     }
 
     uWebSocketsResponse.cork(() => {
-      uWebSocketsResponse.writeStatus(`${response.status} ${response.reasonPhrase}`);
-
-      // every value gets its own header line, which is required for set-cookie (RFC 6265 3)
-      Object.entries(response.headers).forEach(([name, values]) => {
-        values.forEach((value) => {
-          uWebSocketsResponse.writeHeader(name, value);
-        });
-      });
+      writeStatusAndHeaders(response, uWebSocketsResponse);
 
       // an already consumed body does not emit 'end' anymore
       if (body.readableEnded) {

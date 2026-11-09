@@ -1,5 +1,38 @@
+import { connect } from 'node:net';
 import fetch from 'cross-fetch';
 import { expect, test } from 'vitest';
+
+// pipelined requests on one connection, the raw response bytes (without the date header): a wrongly framed response
+// shows up as garbage before the next response
+const rawRequests = (requests: ReadonlyArray<string>): Promise<string> => {
+  const { hostname, port } = new URL(process.env.HTTP_URI as string);
+
+  return new Promise((resolve, reject) => {
+    const chunks: Array<Buffer> = [];
+
+    const socket = connect(Number(port), hostname, () => {
+      socket.end(
+        requests
+          .map(
+            (request, i) =>
+              `${request} HTTP/1.1\r\nHost: ${hostname}\r\n${i === requests.length - 1 ? 'Connection: close\r\n' : ''}\r\n`,
+          )
+          .join(''),
+      );
+    });
+
+    // oxlint-disable-next-line functional/immutable-data
+    socket.on('data', (chunk: Buffer) => chunks.push(chunk));
+    socket.on('error', reject);
+    socket.on('close', () =>
+      resolve(
+        Buffer.concat(chunks)
+          .toString()
+          .replace(/^Date: .*\r\n/gm, ''),
+      ),
+    );
+  });
+};
 
 test('get', async () => {
   const response = await fetch(`${process.env.HTTP_URI}/path/to/get/route?key=value`);
@@ -121,4 +154,51 @@ test('post, with too large body', async () => {
       body: 'a'.repeat(2 * 1024 * 1024),
     }),
   ).rejects.toThrow();
+});
+
+test('head, followed by another request on the same connection', async () => {
+  // the body of the handler does not get sent: the next response follows right after the header section
+  // the next response on the same connection does get its body
+  expect(await rawRequests(['HEAD /path/to/head/route', 'GET /path/to/framing/route'])).toBe(
+    'HTTP/1.1 200 OK\r\n' +
+      'content-type: application/json\r\n' +
+      'set-cookie: key1=value1; Path=/\r\n' +
+      'set-cookie: key2=value2; Path=/\r\n' +
+      'uWebSockets: 20\r\n' +
+      '\r\n' +
+      'HTTP/1.1 200 OK\r\n' +
+      'uWebSockets: 20\r\n' +
+      'Transfer-Encoding: chunked\r\n' +
+      '\r\n' +
+      '6\r\nframed\r\n0\r\n\r\n',
+  );
+});
+
+test('get, with framing headers set by the handler', async () => {
+  // only the framing of uWebSockets.js: no wrong content-length, no duplicated transfer-encoding
+  expect(await rawRequests(['GET /path/to/framing/route', 'GET /path/to/echo/route?echo=next'])).toBe(
+    'HTTP/1.1 200 OK\r\n' +
+      'uWebSockets: 20\r\n' +
+      'Transfer-Encoding: chunked\r\n' +
+      '\r\n' +
+      '6\r\nframed\r\n0\r\n\r\n' +
+      'HTTP/1.1 204 No Content\r\n' +
+      'x-echo: next\r\n' +
+      'uWebSockets: 20\r\n' +
+      '\r\n',
+  );
+});
+
+test('not modified, with body set by the handler', async () => {
+  // the content-length of the GET response gets reported, the body does not get sent
+  expect(await rawRequests(['GET /path/to/not-modified/route', 'GET /path/to/echo/route?echo=next'])).toBe(
+    'HTTP/1.1 304 Not Modified\r\n' +
+      'uWebSockets: 20\r\n' +
+      'Content-Length: 6\r\n' +
+      '\r\n' +
+      'HTTP/1.1 204 No Content\r\n' +
+      'x-echo: next\r\n' +
+      'uWebSockets: 20\r\n' +
+      '\r\n',
+  );
 });

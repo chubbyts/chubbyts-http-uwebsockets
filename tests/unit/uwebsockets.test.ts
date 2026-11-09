@@ -7,9 +7,9 @@ import type { HttpRequest, HttpResponse } from 'uWebSockets.js';
 import { useFunctionMock } from '@chubbyts/chubbyts-function-mock/dist/function-mock';
 import type { ObjectMocks } from '@chubbyts/chubbyts-function-mock/dist/object-mock';
 import { useObjectMock } from '@chubbyts/chubbyts-function-mock/dist/object-mock';
-import type { Body, Response, Uri } from '@chubbyts/chubbyts-http-types/message';
+import type { Body, Message, Response, Uri } from '@chubbyts/chubbyts-http-types/message';
 import type { ServerRequestFactory, UriFactory } from '@chubbyts/chubbyts-http-types/message-factory';
-import type { RequestHelpers } from '@chubbyts/chubbyts-http-types/message-helper';
+import type { HeaderValue, RequestHelpers } from '@chubbyts/chubbyts-http-types/message-helper';
 import {
   createResponseToUWebSocketsResponseEmitter,
   createUWebSocketsRequestToServerRequestFactory,
@@ -42,6 +42,8 @@ const useImplementationMocks = (
         withBody?: boolean;
       }
     | undefined = undefined,
+  // the implementation provides the optional withHeaders, otherwise the bridge falls back to withHeader per header
+  withHeaders = false,
 ) => {
   const [uriFactory, uriFactoryMocks] = useFunctionMock<UriFactory>(
     expected ? [{ parameters: [expected.url], return: uri }] : [],
@@ -66,8 +68,23 @@ const useImplementationMocks = (
       : [],
   );
 
-  const [requestHelpers, requestHelpersMocks] = useObjectMock<RequestHelpers>(
-    expected
+  const [requestHelpers, requestHelpersMocks] = useObjectMock<RequestHelpers>([
+    // resolved once, when the bridge gets created
+    {
+      name: 'withHeaders',
+      value: withHeaders
+        ? <M extends Message>(message: M, headers: Readonly<Record<string, HeaderValue>>): M => {
+            // set at once, grouped by name, in the order of the first occurrence
+            expect(Object.entries(headers)).toEqual(expected?.headers ?? []);
+
+            return {
+              ...message,
+              headers: { ...message.headers, ...(headers as Readonly<Record<string, ReadonlyArray<string>>>) },
+            };
+          }
+        : undefined,
+    },
+    ...((expected
       ? [
           {
             name: 'withProtocolVersion',
@@ -78,15 +95,17 @@ const useImplementationMocks = (
             },
           },
           { name: 'withSignal', callback: (request, signal) => ({ ...request, signal }) },
-          ...(expected.headers ?? []).map(([expectedName, expectedValues]): ObjectMocks<RequestHelpers>[number] => ({
-            name: 'withHeader',
-            callback: (message, name, value) => {
-              expect(name).toBe(expectedName);
-              expect(value).toEqual(expectedValues);
+          ...(withHeaders ? [] : (expected.headers ?? [])).map(
+            ([expectedName, expectedValues]): ObjectMocks<RequestHelpers>[number] => ({
+              name: 'withHeader',
+              callback: (message, name, value) => {
+                expect(name).toBe(expectedName);
+                expect(value).toEqual(expectedValues);
 
-              return { ...message, headers: { ...message.headers, [name]: value as ReadonlyArray<string> } };
-            },
-          })),
+                return { ...message, headers: { ...message.headers, [name]: value as ReadonlyArray<string> } };
+              },
+            }),
+          ),
           ...(expected.withBody
             ? [
                 {
@@ -96,8 +115,8 @@ const useImplementationMocks = (
               ]
             : []),
         ]
-      : [],
-  );
+      : []) satisfies ObjectMocks<RequestHelpers>),
+  ]);
 
   return {
     uriFactory,
@@ -249,7 +268,7 @@ describe('uwebsockets', () => {
   });
 
   describe('createUWebSocketsRequestToServerRequestFactory', () => {
-    test('without body', async () => {
+    test.each([false, true])('without body, with withHeaders %s', async (withHeaders) => {
       const handlers: Handlers = {};
 
       const [uWebSocketsRequest, uWebSocketsRequestMocks] = useObjectMock<HttpRequest>(
@@ -260,6 +279,8 @@ describe('uwebsockets', () => {
           ['cookie', 'sessionId=abc123'],
           ['cookie', 'ui_lang=en-US'],
           ['authorization', 'Bearer token1'],
+          // a valid token: must neither change the prototype of the headers nor get lost
+          ['__proto__', 'value'],
         ]),
       );
 
@@ -268,16 +289,20 @@ describe('uwebsockets', () => {
       ]);
 
       // grouped by name, in the order of the first occurrence
-      const { uriFactory, serverRequestFactory, requestHelpers, mocks } = useImplementationMocks({
-        url: 'https://example.com/path/to/route?key=value',
-        method: 'GET',
-        headers: [
-          ['content-type', ['text/plain']],
-          ['x-custom', ['value1', 'value2']],
-          ['cookie', ['sessionId=abc123', 'ui_lang=en-US']],
-          ['authorization', ['Bearer token1']],
-        ],
-      });
+      const { uriFactory, serverRequestFactory, requestHelpers, mocks } = useImplementationMocks(
+        {
+          url: 'https://example.com/path/to/route?key=value',
+          method: 'GET',
+          headers: [
+            ['content-type', ['text/plain']],
+            ['x-custom', ['value1', 'value2']],
+            ['cookie', ['sessionId=abc123', 'ui_lang=en-US']],
+            ['authorization', ['Bearer token1']],
+            ['__proto__', ['value']],
+          ],
+        },
+        withHeaders,
+      );
 
       const uWebSocketsRequestToServerRequestFactory = createUWebSocketsRequestToServerRequestFactory(
         uriFactory,
@@ -291,8 +316,12 @@ describe('uwebsockets', () => {
       expect(serverRequest.method).toBe('GET');
       expect(serverRequest.uri).toBe(uri);
       expect(serverRequest.protocolVersion).toBe('1.1');
+      expect(Object.getPrototypeOf(serverRequest.headers)).toBe(Object.prototype);
       expect(serverRequest.headers).toMatchInlineSnapshot(`
         {
+          "__proto__": [
+            "value",
+          ],
           "authorization": [
             "Bearer token1",
           ],
@@ -826,7 +855,9 @@ describe('uwebsockets', () => {
     test.each([0, 1.5, Infinity])('with valid request body max bytes %s', (requestBodyMaxBytes) => {
       const [uriFactory, uriFactoryMocks] = useFunctionMock<UriFactory>([]);
       const [serverRequestFactory, serverRequestFactoryMocks] = useFunctionMock<ServerRequestFactory>([]);
-      const [requestHelpers, requestHelpersMocks] = useObjectMock<RequestHelpers>([]);
+      const [requestHelpers, requestHelpersMocks] = useObjectMock<RequestHelpers>([
+        { name: 'withHeaders', value: undefined },
+      ]);
 
       expect(
         createUWebSocketsRequestToServerRequestFactory(
@@ -984,7 +1015,7 @@ describe('uwebsockets', () => {
     });
 
     test.each([
-      [100, 'Continue'],
+      [200, 'OK'],
       [999, 'Custom'],
     ])('with valid response status %d', async (status, reasonPhrase) => {
       const handlers: Handlers = {};
@@ -1010,6 +1041,168 @@ describe('uwebsockets', () => {
         createResponse({ status, reasonPhrase, body: Readable.from([]) }),
         uWebSocketsResponse,
       );
+
+      await ended.promise;
+
+      expect(uWebSocketsResponseMocks).toHaveLength(0);
+    });
+
+    test.each([
+      ['get', true],
+      ['head', false],
+    ])('with response to %s request', async (method, withContent) => {
+      const handlers: Handlers = {};
+
+      const ended = Promise.withResolvers<undefined>();
+
+      const [uWebSocketsRequest] = useObjectMock<HttpRequest>(requestMocks(method, '/', ''));
+
+      const body = Readable.from([Buffer.from('content')]);
+
+      const [uWebSocketsResponse, uWebSocketsResponseMocks] = useObjectMock<HttpResponse>([
+        onAbortedMock(handlers, (): HttpResponse => uWebSocketsResponse),
+        corkMock((): HttpResponse => uWebSocketsResponse),
+        { name: 'writeStatus', parameters: ['200 OK'], returnSelf: true },
+        // the content-length of the handler does not get written, for HEAD it gets reported by uWebSockets.js
+        { name: 'writeHeader', parameters: ['content-type', 'text/plain'], returnSelf: true },
+        ...(withContent
+          ? [
+              corkMock((): HttpResponse => uWebSocketsResponse),
+              writeMock('content', true),
+              corkMock((): HttpResponse => uWebSocketsResponse),
+            ]
+          : []),
+        {
+          name: withContent ? 'end' : 'endWithoutBody',
+          callback: (...args: Array<unknown>): HttpResponse => {
+            expect(args).toEqual(withContent ? [] : [7]);
+
+            ended.resolve(undefined);
+
+            return uWebSocketsResponse;
+          },
+        },
+      ]);
+
+      const { uriFactory, serverRequestFactory, requestHelpers } = useImplementationMocks({
+        url: 'http://127.0.0.1/',
+        method: method.toUpperCase(),
+      });
+
+      createUWebSocketsRequestToServerRequestFactory(
+        uriFactory,
+        serverRequestFactory,
+        requestHelpers,
+      )(uWebSocketsRequest, uWebSocketsResponse);
+
+      createResponseToUWebSocketsResponseEmitter()(
+        createResponse({ headers: { 'content-type': ['text/plain'], 'content-length': ['7'] }, body }),
+        uWebSocketsResponse,
+      );
+
+      await ended.promise;
+
+      // the body of a response without content does not get read but cancelled
+      expect(body.destroyed).toBe(true);
+      expect(body.readableEnded).toBe(withContent);
+
+      expect(uWebSocketsResponseMocks).toHaveLength(0);
+    });
+
+    test.each([
+      // a 1xx or 204 response must not have a content-length (RFC 9110 8.6)
+      [100, 'Continue', { 'content-length': ['42'] }, undefined],
+      [199, 'Custom', { 'content-length': ['42'] }, undefined],
+      [204, 'No Content', { 'content-length': ['42'] }, undefined],
+      // a 304 response may announce the content-length of the GET response
+      [304, 'Not Modified', { 'content-length': ['42'] }, 42],
+      [304, 'Not Modified', { 'Content-Length': ['0'] }, 0],
+      [304, 'Not Modified', { 'content-length': ['9007199254740991'] }, 9007199254740991],
+      [304, 'Not Modified', {}, undefined],
+      [304, 'Not Modified', { 'content-length': [] }, undefined],
+      [304, 'Not Modified', { 'content-length': ['42', '42'] }, undefined],
+      [304, 'Not Modified', { 'content-length': ['4 2'] }, undefined],
+      [304, 'Not Modified', { 'content-length': ['42a'] }, undefined],
+      [304, 'Not Modified', { 'content-length': ['a42'] }, undefined],
+      [304, 'Not Modified', { 'content-length': ['-1'] }, undefined],
+      [304, 'Not Modified', { 'content-length': ['1.5'] }, undefined],
+      [304, 'Not Modified', { 'content-length': ['1e3'] }, undefined],
+      [304, 'Not Modified', { 'content-length': ['0x2A'] }, undefined],
+      [304, 'Not Modified', { 'content-length': [' 42'] }, undefined],
+      [304, 'Not Modified', { 'content-length': ['42 '] }, undefined],
+      [304, 'Not Modified', { 'content-length': [''] }, undefined],
+      [304, 'Not Modified', { 'content-length': ['9007199254740992'] }, undefined],
+    ])(
+      'with response without content, with status %d, with headers %j',
+      async (status, reasonPhrase, headers, reportedContentLength) => {
+        const handlers: Handlers = {};
+
+        const body = new Readable({ read() {} });
+
+        const [uWebSocketsResponse, uWebSocketsResponseMocks] = useObjectMock<HttpResponse>([
+          onAbortedMock(handlers, (): HttpResponse => uWebSocketsResponse),
+          corkMock((): HttpResponse => uWebSocketsResponse),
+          { name: 'writeStatus', parameters: [`${status} ${reasonPhrase}`], returnSelf: true },
+          { name: 'writeHeader', parameters: ['etag', '"abc"'], returnSelf: true },
+          // the content-length header gets written by uWebSockets.js only, an explicit undefined would make it report
+          // a content-length of 2^63
+          {
+            name: 'endWithoutBody',
+            parameters: reportedContentLength !== undefined ? [reportedContentLength] : [],
+            returnSelf: true,
+          },
+        ]);
+
+        createResponseToUWebSocketsResponseEmitter(50)(
+          createResponse({ status, reasonPhrase, headers: { etag: ['"abc"'], ...headers }, body }),
+          uWebSocketsResponse,
+        );
+
+        // no timeout gets started (a close call would fail with a missing mock)
+        await wait(100);
+
+        expect(body.destroyed).toBe(true);
+
+        expect(uWebSocketsResponseMocks).toHaveLength(0);
+      },
+    );
+
+    test('with framing headers set by the handler', async () => {
+      const handlers: Handlers = {};
+
+      const ended = Promise.withResolvers<undefined>();
+
+      const response = createResponse({
+        headers: {
+          'content-length': ['999'],
+          'Content-Length': ['999'],
+          'content-type': ['text/plain'],
+          'transfer-encoding': ['chunked'],
+          'Transfer-Encoding': ['gzip, chunked'],
+        },
+        body: Readable.from([Buffer.from('content')]),
+      });
+
+      // uWebSockets.js writes the framing headers itself: the ones of the handler would be duplicated or conflicting
+      const [uWebSocketsResponse, uWebSocketsResponseMocks] = useObjectMock<HttpResponse>([
+        onAbortedMock(handlers, (): HttpResponse => uWebSocketsResponse),
+        corkMock((): HttpResponse => uWebSocketsResponse),
+        { name: 'writeStatus', parameters: ['200 OK'], returnSelf: true },
+        { name: 'writeHeader', parameters: ['content-type', 'text/plain'], returnSelf: true },
+        corkMock((): HttpResponse => uWebSocketsResponse),
+        writeMock('content', true),
+        corkMock((): HttpResponse => uWebSocketsResponse),
+        {
+          name: 'end',
+          callback: (): HttpResponse => {
+            ended.resolve(undefined);
+
+            return uWebSocketsResponse;
+          },
+        },
+      ]);
+
+      createResponseToUWebSocketsResponseEmitter()(response, uWebSocketsResponse);
 
       await ended.promise;
 

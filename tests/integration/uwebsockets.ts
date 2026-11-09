@@ -46,6 +46,28 @@ const handler: Handler = async (serverRequest: ServerRequest): Promise<Response>
     );
   }
 
+  // a handler setting framing headers (here even a wrong content-length): uWebSockets.js has to frame the response
+  if (serverRequest.uri.path === '/path/to/framing/route') {
+    return responseHelpers.withHeader(
+      responseHelpers.withHeader(
+        responseHelpers.withBody(responseFactory(200), streamFactory('framed')),
+        'content-length',
+        '999',
+      ),
+      'transfer-encoding',
+      'chunked',
+    );
+  }
+
+  // a response which must not have content, even if the handler provides a body
+  if (serverRequest.uri.path === '/path/to/not-modified/route') {
+    return responseHelpers.withHeader(
+      responseHelpers.withBody(responseFactory(304), streamFactory('unsent')),
+      'content-length',
+      '6',
+    );
+  }
+
   const { host: _, ...otherHeaders } = serverRequest.headers;
 
   const response = responseHelpers.withBody(

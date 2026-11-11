@@ -168,25 +168,37 @@ test('head, followed by another request on the same connection', async () => {
       '\r\n' +
       'HTTP/1.1 200 OK\r\n' +
       'uWebSockets: 20\r\n' +
-      'Transfer-Encoding: chunked\r\n' +
+      'Content-Length: 6\r\n' +
       '\r\n' +
-      '6\r\nframed\r\n0\r\n\r\n',
+      'framed',
   );
 });
 
 test('get, with framing headers set by the handler', async () => {
-  // only the framing of uWebSockets.js: no wrong content-length, no duplicated transfer-encoding
+  // only the framing of uWebSockets.js: no wrong content-length, no duplicated transfer-encoding, a body provided at
+  // once gets sent with a content-length
   expect(await rawRequests(['GET /path/to/framing/route', 'GET /path/to/echo/route?echo=next'])).toBe(
     'HTTP/1.1 200 OK\r\n' +
       'uWebSockets: 20\r\n' +
-      'Transfer-Encoding: chunked\r\n' +
+      'Content-Length: 6\r\n' +
       '\r\n' +
-      '6\r\nframed\r\n0\r\n\r\n' +
+      'framed' +
       'HTTP/1.1 204 No Content\r\n' +
       'x-echo: next\r\n' +
       'uWebSockets: 20\r\n' +
       '\r\n',
   );
+});
+
+test('get, with streamed body', async () => {
+  const response = await fetch(`${process.env.HTTP_URI}/path/to/streamed/route`);
+
+  // a body taking longer than the current event loop turn gets streamed chunked
+  expect(response.status).toBe(200);
+  expect(response.headers.get('transfer-encoding')).toBe('chunked');
+  expect(response.headers.get('content-length')).toBeNull();
+
+  expect(await response.text()).toBe('streamed');
 });
 
 test('not modified, with body set by the handler', async () => {

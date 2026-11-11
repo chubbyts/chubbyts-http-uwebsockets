@@ -59,6 +59,18 @@ const handler: Handler = async (serverRequest: ServerRequest): Promise<Response>
     );
   }
 
+  // a body taking longer than the current event loop turn gets streamed
+  if (serverRequest.uri.path === '/path/to/streamed/route') {
+    return responseHelpers.withBody(
+      responseFactory(200),
+      (async function* () {
+        yield Buffer.from('stream');
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        yield Buffer.from('ed');
+      })(),
+    );
+  }
+
   // a response which must not have content, even if the handler provides a body
   if (serverRequest.uri.path === '/path/to/not-modified/route') {
     return responseHelpers.withHeader(

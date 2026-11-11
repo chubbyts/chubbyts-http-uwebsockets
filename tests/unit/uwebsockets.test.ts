@@ -184,6 +184,47 @@ const writeMock = (expected: string, writable: boolean): ObjectMocks<HttpRespons
   },
 });
 
+// with a body: the whole body at once (uWebSockets.js adds the content-length), without: the end of a streamed body
+const endMock = (
+  getResponse: () => HttpResponse,
+  expected: string | undefined,
+  ended: PromiseWithResolvers<undefined> | undefined = undefined,
+): ObjectMocks<HttpResponse>[number] => ({
+  name: 'end',
+  callback: (...args: Array<unknown>): HttpResponse => {
+    expect(args.map((chunk) => Buffer.from(chunk as Uint8Array).toString())).toEqual(
+      expected !== undefined ? [expected] : [],
+    );
+
+    ended?.resolve(undefined);
+
+    return getResponse();
+  },
+});
+
+// uWebSockets.js allows arbitrary user data to be attached to a response (the bridge keeps its state there, symbol
+// keyed): the object mock only verifies the method calls, the user data is kept aside
+const useHttpResponseMock = (mocks: ObjectMocks<HttpResponse>): [HttpResponse, ObjectMocks<HttpResponse>] => {
+  const [objectMock, objectMocks] = useObjectMock<HttpResponse>(mocks);
+
+  const userData = new Map<symbol, unknown>();
+
+  const uWebSocketsResponse = new Proxy(objectMock, {
+    get: (target, name) => (typeof name === 'symbol' ? userData.get(name) : Reflect.get(target, name)),
+    set: (_, name, value) => {
+      if (typeof name !== 'symbol') {
+        return false;
+      }
+
+      userData.set(name, value);
+
+      return true;
+    },
+  });
+
+  return [uWebSocketsResponse, objectMocks];
+};
+
 const toArrayBuffer = (content: string): ArrayBuffer => new TextEncoder().encode(content).buffer as ArrayBuffer;
 
 const createResponse = (overrides: Partial<Response> = {}): Response => ({
@@ -200,7 +241,7 @@ const useAbortedResponse = () => {
 
   const [uWebSocketsRequest] = useObjectMock<HttpRequest>(requestMocks('get', '/', ''));
 
-  const [uWebSocketsResponse, uWebSocketsResponseMocks] = useObjectMock<HttpResponse>([
+  const [uWebSocketsResponse, uWebSocketsResponseMocks] = useHttpResponseMock([
     onAbortedMock(handlers, (): HttpResponse => uWebSocketsResponse),
   ]);
 
@@ -284,7 +325,7 @@ describe('uwebsockets', () => {
         ]),
       );
 
-      const [uWebSocketsResponse, uWebSocketsResponseMocks] = useObjectMock<HttpResponse>([
+      const [uWebSocketsResponse, uWebSocketsResponseMocks] = useHttpResponseMock([
         onAbortedMock(handlers, (): HttpResponse => uWebSocketsResponse),
       ]);
 
@@ -362,7 +403,7 @@ describe('uwebsockets', () => {
       ]);
 
       // onAborted gets registered only once per response
-      const [uWebSocketsResponse, uWebSocketsResponseMocks] = useObjectMock<HttpResponse>([
+      const [uWebSocketsResponse, uWebSocketsResponseMocks] = useHttpResponseMock([
         onAbortedMock(handlers, (): HttpResponse => uWebSocketsResponse),
       ]);
 
@@ -401,7 +442,7 @@ describe('uwebsockets', () => {
           [name, 'Basic dXNlcjI='],
         ]).slice(0, 2),
       );
-      const [uWebSocketsResponse, uWebSocketsResponseMocks] = useObjectMock<HttpResponse>([]);
+      const [uWebSocketsResponse, uWebSocketsResponseMocks] = useHttpResponseMock([]);
 
       const { uriFactory, serverRequestFactory, requestHelpers, mocks } = useImplementationMocks();
 
@@ -427,7 +468,7 @@ describe('uwebsockets', () => {
         requestMocks('post', '/path/to/route', ''),
       );
 
-      const [uWebSocketsResponse, uWebSocketsResponseMocks] = useObjectMock<HttpResponse>([
+      const [uWebSocketsResponse, uWebSocketsResponseMocks] = useHttpResponseMock([
         onAbortedMock(handlers, (): HttpResponse => uWebSocketsResponse),
         onDataMock(handlers, (): HttpResponse => uWebSocketsResponse),
       ]);
@@ -469,7 +510,7 @@ describe('uwebsockets', () => {
         requestMocks('post', '/path/to/route', ''),
       );
 
-      const [uWebSocketsResponse, uWebSocketsResponseMocks] = useObjectMock<HttpResponse>([
+      const [uWebSocketsResponse, uWebSocketsResponseMocks] = useHttpResponseMock([
         onAbortedMock(handlers, (): HttpResponse => uWebSocketsResponse),
         onDataMock(handlers, (): HttpResponse => uWebSocketsResponse),
       ]);
@@ -488,13 +529,17 @@ describe('uwebsockets', () => {
 
       const serverRequest = uWebSocketsRequestToServerRequestFactory(uWebSocketsRequest, uWebSocketsResponse);
 
+      // the handler waits for the body: receiving has not been paused, it does not get resumed (a resume call would
+      // fail with a missing mock)
+      const content = text(serverRequest.body);
+
       // no request body timeout is configured: a slow body must not lead to a closed response (a close call would
       // fail with a missing mock)
       await wait(50);
 
       handlers.data?.(toArrayBuffer('delayed'), true);
 
-      expect(await text(serverRequest.body)).toBe('delayed');
+      expect(await content).toBe('delayed');
 
       expect(uWebSocketsRequestMocks).toHaveLength(0);
       expect(uWebSocketsResponseMocks).toHaveLength(0);
@@ -508,7 +553,7 @@ describe('uwebsockets', () => {
         requestMocks('post', '/path/to/route', ''),
       );
 
-      const [uWebSocketsResponse, uWebSocketsResponseMocks] = useObjectMock<HttpResponse>([
+      const [uWebSocketsResponse, uWebSocketsResponseMocks] = useHttpResponseMock([
         onAbortedMock(handlers, (): HttpResponse => uWebSocketsResponse),
         onDataMock(handlers, (): HttpResponse => uWebSocketsResponse),
       ]);
@@ -551,7 +596,7 @@ describe('uwebsockets', () => {
         requestMocks('post', '/path/to/route', ''),
       );
 
-      const [uWebSocketsResponse, uWebSocketsResponseMocks] = useObjectMock<HttpResponse>([
+      const [uWebSocketsResponse, uWebSocketsResponseMocks] = useHttpResponseMock([
         onAbortedMock(handlers, (): HttpResponse => uWebSocketsResponse),
         onDataMock(handlers, (): HttpResponse => uWebSocketsResponse),
         {
@@ -603,7 +648,7 @@ describe('uwebsockets', () => {
         requestMocks('post', '/path/to/route', ''),
       );
 
-      const [uWebSocketsResponse, uWebSocketsResponseMocks] = useObjectMock<HttpResponse>([
+      const [uWebSocketsResponse, uWebSocketsResponseMocks] = useHttpResponseMock([
         onAbortedMock(handlers, (): HttpResponse => uWebSocketsResponse),
         onDataMock(handlers, (): HttpResponse => uWebSocketsResponse),
       ]);
@@ -644,7 +689,7 @@ describe('uwebsockets', () => {
         requestMocks('post', '/path/to/route', ''),
       );
 
-      const [uWebSocketsResponse, uWebSocketsResponseMocks] = useObjectMock<HttpResponse>([
+      const [uWebSocketsResponse, uWebSocketsResponseMocks] = useHttpResponseMock([
         onAbortedMock(handlers, (): HttpResponse => uWebSocketsResponse),
         onDataMock(handlers, (): HttpResponse => uWebSocketsResponse),
       ]);
@@ -687,7 +732,7 @@ describe('uwebsockets', () => {
         requestMocks('post', '/path/to/route', ''),
       );
 
-      const [uWebSocketsResponse, uWebSocketsResponseMocks] = useObjectMock<HttpResponse>([
+      const [uWebSocketsResponse, uWebSocketsResponseMocks] = useHttpResponseMock([
         onAbortedMock(handlers, (): HttpResponse => uWebSocketsResponse),
         onDataMock(handlers, (): HttpResponse => uWebSocketsResponse),
         { name: 'pause', parameters: [], return: undefined },
@@ -724,10 +769,16 @@ describe('uwebsockets', () => {
 
       await resumed.promise;
 
+      // receiving is not paused anymore: reading the next chunk does not resume it again (a resume call would fail
+      // with a missing mock)
+      handlers.data?.(toArrayBuffer('b'), false);
+
+      await wait(10);
+
       // the last chunk does not pause anymore, even when exceeding the high water mark
       handlers.data?.(toArrayBuffer(largeChunk), true);
 
-      expect(await content).toBe(largeChunk + largeChunk);
+      expect(await content).toBe(largeChunk + 'b' + largeChunk);
 
       expect(uWebSocketsRequestMocks).toHaveLength(0);
       expect(uWebSocketsResponseMocks).toHaveLength(0);
@@ -741,7 +792,7 @@ describe('uwebsockets', () => {
         requestMocks('post', '/path/to/route', '', [['content-length', '11']]),
       );
 
-      const [uWebSocketsResponse, uWebSocketsResponseMocks] = useObjectMock<HttpResponse>([
+      const [uWebSocketsResponse, uWebSocketsResponseMocks] = useHttpResponseMock([
         onAbortedMock(handlers, (): HttpResponse => uWebSocketsResponse),
         {
           name: 'close',
@@ -791,7 +842,7 @@ describe('uwebsockets', () => {
         requestMocks('post', '/path/to/route', '', [['content-length', '10']]),
       );
 
-      const [uWebSocketsResponse, uWebSocketsResponseMocks] = useObjectMock<HttpResponse>([
+      const [uWebSocketsResponse, uWebSocketsResponseMocks] = useHttpResponseMock([
         onAbortedMock(handlers, (): HttpResponse => uWebSocketsResponse),
         onDataMock(handlers, (): HttpResponse => uWebSocketsResponse),
         { name: 'close', parameters: [], returnSelf: true },
@@ -892,26 +943,15 @@ describe('uwebsockets', () => {
         body: Readable.from([Buffer.from('{"name":'), Buffer.from('"test"}')]),
       });
 
-      const [uWebSocketsResponse, uWebSocketsResponseMocks] = useObjectMock<HttpResponse>([
+      // the body provided within the current event loop turn gets sent along with the status and the headers at once
+      const [uWebSocketsResponse, uWebSocketsResponseMocks] = useHttpResponseMock([
         onAbortedMock(handlers, (): HttpResponse => uWebSocketsResponse),
         corkMock((): HttpResponse => uWebSocketsResponse),
         { name: 'writeStatus', parameters: ['201 Created'], returnSelf: true },
         { name: 'writeHeader', parameters: ['content-type', 'application/json'], returnSelf: true },
         { name: 'writeHeader', parameters: ['set-cookie', 'key1=value1; Path=/'], returnSelf: true },
         { name: 'writeHeader', parameters: ['set-cookie', 'key2=value2; Path=/'], returnSelf: true },
-        corkMock((): HttpResponse => uWebSocketsResponse),
-        writeMock('{"name":', true),
-        corkMock((): HttpResponse => uWebSocketsResponse),
-        writeMock('"test"}', true),
-        corkMock((): HttpResponse => uWebSocketsResponse),
-        {
-          name: 'end',
-          callback: (): HttpResponse => {
-            ended.resolve(undefined);
-
-            return uWebSocketsResponse;
-          },
-        },
+        endMock((): HttpResponse => uWebSocketsResponse, '{"name":"test"}', ended),
       ]);
 
       const responseToUWebSocketsResponseEmitter = createResponseToUWebSocketsResponseEmitter();
@@ -920,14 +960,13 @@ describe('uwebsockets', () => {
 
       await ended.promise;
 
-      // no response send timeout is configured: no timer may close the response afterwards (a close call would fail
-      // with a missing mock)
+      // the streaming does not start afterwards (a cork call would fail with a missing mock)
       await wait(50);
 
       expect(uWebSocketsResponseMocks).toHaveLength(0);
     });
 
-    test('with async generator body, with backpressure', async () => {
+    test('with async generator body', async () => {
       const handlers: Handlers = {};
 
       const ended = Promise.withResolvers<undefined>();
@@ -939,11 +978,42 @@ describe('uwebsockets', () => {
         })(),
       });
 
-      const [uWebSocketsResponse, uWebSocketsResponseMocks] = useObjectMock<HttpResponse>([
+      // the chunks provided within the current event loop turn (resolved promises) get sent at once
+      const [uWebSocketsResponse, uWebSocketsResponseMocks] = useHttpResponseMock([
         onAbortedMock(handlers, (): HttpResponse => uWebSocketsResponse),
         corkMock((): HttpResponse => uWebSocketsResponse),
         { name: 'writeStatus', parameters: ['200 OK'], returnSelf: true },
+        endMock((): HttpResponse => uWebSocketsResponse, 'chunk1chunk2', ended),
+      ]);
+
+      createResponseToUWebSocketsResponseEmitter()(response, uWebSocketsResponse);
+
+      await ended.promise;
+
+      expect(uWebSocketsResponseMocks).toHaveLength(0);
+    });
+
+    test('with streamed body, with backpressure', async () => {
+      const handlers: Handlers = {};
+
+      const ended = Promise.withResolvers<undefined>();
+
+      const response = createResponse({
+        headers: { 'content-type': ['text/plain'] },
+        body: (async function* () {
+          yield new TextEncoder().encode('chunk1');
+          await wait(10);
+          yield new TextEncoder().encode('chunk2');
+        })(),
+      });
+
+      // a body taking longer than the current event loop turn gets streamed: the status, the headers and the chunks
+      // collected so far get sent at once, the remaining chunks on their own
+      const [uWebSocketsResponse, uWebSocketsResponseMocks] = useHttpResponseMock([
+        onAbortedMock(handlers, (): HttpResponse => uWebSocketsResponse),
         corkMock((): HttpResponse => uWebSocketsResponse),
+        { name: 'writeStatus', parameters: ['200 OK'], returnSelf: true },
+        { name: 'writeHeader', parameters: ['content-type', 'text/plain'], returnSelf: true },
         writeMock('chunk1', false),
         {
           name: 'onWritable',
@@ -956,14 +1026,7 @@ describe('uwebsockets', () => {
         corkMock((): HttpResponse => uWebSocketsResponse),
         writeMock('chunk2', true),
         corkMock((): HttpResponse => uWebSocketsResponse),
-        {
-          name: 'end',
-          callback: (): HttpResponse => {
-            ended.resolve(undefined);
-
-            return uWebSocketsResponse;
-          },
-        },
+        endMock((): HttpResponse => uWebSocketsResponse, undefined, ended),
       ]);
 
       const responseToUWebSocketsResponseEmitter = createResponseToUWebSocketsResponseEmitter();
@@ -971,11 +1034,48 @@ describe('uwebsockets', () => {
       responseToUWebSocketsResponseEmitter(response, uWebSocketsResponse);
 
       // the body is paused until the client is able to receive more data
-      await wait(20);
+      await wait(30);
 
       expect(uWebSocketsResponseMocks).toHaveLength(4);
 
       expect(handlers.writable?.(0)).toBe(true);
+
+      await ended.promise;
+
+      expect(uWebSocketsResponseMocks).toHaveLength(0);
+    });
+
+    test.each([
+      // up to the limit the body gets collected and sent at once
+      [[32 * 1024, 32 * 1024], false],
+      // a larger body gets streamed right away, without waiting for the end of the current event loop turn
+      [[32 * 1024, 32 * 1024 + 1], true],
+    ])('with large body, with chunk sizes %j', async (sizes, streamed) => {
+      const handlers: Handlers = {};
+
+      const ended = Promise.withResolvers<undefined>();
+
+      const chunks = sizes.map((size, i) => Buffer.alloc(size, String(i)));
+
+      const [uWebSocketsResponse, uWebSocketsResponseMocks] = useHttpResponseMock([
+        onAbortedMock(handlers, (): HttpResponse => uWebSocketsResponse),
+        corkMock((): HttpResponse => uWebSocketsResponse),
+        { name: 'writeStatus', parameters: ['200 OK'], returnSelf: true },
+        ...(streamed
+          ? [
+              writeMock(chunks[0].toString(), true),
+              writeMock(chunks[1].toString(), true),
+              corkMock((): HttpResponse => uWebSocketsResponse),
+              endMock((): HttpResponse => uWebSocketsResponse, undefined, ended),
+            ]
+          : [endMock((): HttpResponse => uWebSocketsResponse, Buffer.concat(chunks).toString(), ended)]),
+      ]);
+
+      // the end of the body follows within the same event loop turn: it does not change how the body gets sent
+      createResponseToUWebSocketsResponseEmitter()(
+        createResponse({ body: Readable.from(chunks) }),
+        uWebSocketsResponse,
+      );
 
       await ended.promise;
 
@@ -999,7 +1099,7 @@ describe('uwebsockets', () => {
       const body = new Readable({ read() {} });
 
       // nothing gets written to the response (a call would fail with a missing mock)
-      const [uWebSocketsResponse, uWebSocketsResponseMocks] = useObjectMock<HttpResponse>([
+      const [uWebSocketsResponse, uWebSocketsResponseMocks] = useHttpResponseMock([
         onAbortedMock(handlers, (): HttpResponse => uWebSocketsResponse),
       ]);
 
@@ -1022,19 +1122,11 @@ describe('uwebsockets', () => {
 
       const ended = Promise.withResolvers<undefined>();
 
-      const [uWebSocketsResponse, uWebSocketsResponseMocks] = useObjectMock<HttpResponse>([
+      const [uWebSocketsResponse, uWebSocketsResponseMocks] = useHttpResponseMock([
         onAbortedMock(handlers, (): HttpResponse => uWebSocketsResponse),
         corkMock((): HttpResponse => uWebSocketsResponse),
         { name: 'writeStatus', parameters: [`${status} ${reasonPhrase}`], returnSelf: true },
-        corkMock((): HttpResponse => uWebSocketsResponse),
-        {
-          name: 'end',
-          callback: (): HttpResponse => {
-            ended.resolve(undefined);
-
-            return uWebSocketsResponse;
-          },
-        },
+        endMock((): HttpResponse => uWebSocketsResponse, '', ended),
       ]);
 
       createResponseToUWebSocketsResponseEmitter()(
@@ -1059,29 +1151,24 @@ describe('uwebsockets', () => {
 
       const body = Readable.from([Buffer.from('content')]);
 
-      const [uWebSocketsResponse, uWebSocketsResponseMocks] = useObjectMock<HttpResponse>([
+      const [uWebSocketsResponse, uWebSocketsResponseMocks] = useHttpResponseMock([
         onAbortedMock(handlers, (): HttpResponse => uWebSocketsResponse),
         corkMock((): HttpResponse => uWebSocketsResponse),
         { name: 'writeStatus', parameters: ['200 OK'], returnSelf: true },
         // the content-length of the handler does not get written, for HEAD it gets reported by uWebSockets.js
         { name: 'writeHeader', parameters: ['content-type', 'text/plain'], returnSelf: true },
-        ...(withContent
-          ? [
-              corkMock((): HttpResponse => uWebSocketsResponse),
-              writeMock('content', true),
-              corkMock((): HttpResponse => uWebSocketsResponse),
-            ]
-          : []),
-        {
-          name: withContent ? 'end' : 'endWithoutBody',
-          callback: (...args: Array<unknown>): HttpResponse => {
-            expect(args).toEqual(withContent ? [] : [7]);
+        withContent
+          ? endMock((): HttpResponse => uWebSocketsResponse, 'content', ended)
+          : {
+              name: 'endWithoutBody',
+              callback: (...args: Array<unknown>): HttpResponse => {
+                expect(args).toEqual([7]);
 
-            ended.resolve(undefined);
+                ended.resolve(undefined);
 
-            return uWebSocketsResponse;
-          },
-        },
+                return uWebSocketsResponse;
+              },
+            },
       ]);
 
       const { uriFactory, serverRequestFactory, requestHelpers } = useImplementationMocks({
@@ -1139,7 +1226,7 @@ describe('uwebsockets', () => {
 
         const body = new Readable({ read() {} });
 
-        const [uWebSocketsResponse, uWebSocketsResponseMocks] = useObjectMock<HttpResponse>([
+        const [uWebSocketsResponse, uWebSocketsResponseMocks] = useHttpResponseMock([
           onAbortedMock(handlers, (): HttpResponse => uWebSocketsResponse),
           corkMock((): HttpResponse => uWebSocketsResponse),
           { name: 'writeStatus', parameters: [`${status} ${reasonPhrase}`], returnSelf: true },
@@ -1184,22 +1271,12 @@ describe('uwebsockets', () => {
       });
 
       // uWebSockets.js writes the framing headers itself: the ones of the handler would be duplicated or conflicting
-      const [uWebSocketsResponse, uWebSocketsResponseMocks] = useObjectMock<HttpResponse>([
+      const [uWebSocketsResponse, uWebSocketsResponseMocks] = useHttpResponseMock([
         onAbortedMock(handlers, (): HttpResponse => uWebSocketsResponse),
         corkMock((): HttpResponse => uWebSocketsResponse),
         { name: 'writeStatus', parameters: ['200 OK'], returnSelf: true },
         { name: 'writeHeader', parameters: ['content-type', 'text/plain'], returnSelf: true },
-        corkMock((): HttpResponse => uWebSocketsResponse),
-        writeMock('content', true),
-        corkMock((): HttpResponse => uWebSocketsResponse),
-        {
-          name: 'end',
-          callback: (): HttpResponse => {
-            ended.resolve(undefined);
-
-            return uWebSocketsResponse;
-          },
-        },
+        endMock((): HttpResponse => uWebSocketsResponse, 'content', ended),
       ]);
 
       createResponseToUWebSocketsResponseEmitter()(response, uWebSocketsResponse);
@@ -1221,21 +1298,13 @@ describe('uwebsockets', () => {
         body: Readable.from([]),
       });
 
-      const [uWebSocketsResponse, uWebSocketsResponseMocks] = useObjectMock<HttpResponse>([
+      const [uWebSocketsResponse, uWebSocketsResponseMocks] = useHttpResponseMock([
         onAbortedMock(handlers, (): HttpResponse => uWebSocketsResponse),
         corkMock((): HttpResponse => uWebSocketsResponse),
         { name: 'writeStatus', parameters: ['599 Custom \tR\u00e9ason'], returnSelf: true },
         { name: 'writeHeader', parameters: ["!#$%&'*+-.^_`|~09AZaz", ''], returnSelf: true },
         { name: 'writeHeader', parameters: ["!#$%&'*+-.^_`|~09AZaz", 'tab\tvalue \u00ff'], returnSelf: true },
-        corkMock((): HttpResponse => uWebSocketsResponse),
-        {
-          name: 'end',
-          callback: (): HttpResponse => {
-            ended.resolve(undefined);
-
-            return uWebSocketsResponse;
-          },
-        },
+        endMock((): HttpResponse => uWebSocketsResponse, '', ended),
       ]);
 
       createResponseToUWebSocketsResponseEmitter()(response, uWebSocketsResponse);
@@ -1253,7 +1322,7 @@ describe('uwebsockets', () => {
       body.destroy(new Error('upstream failed'));
 
       // nothing gets written to the response (a call would fail with a missing mock)
-      const [uWebSocketsResponse, uWebSocketsResponseMocks] = useObjectMock<HttpResponse>([
+      const [uWebSocketsResponse, uWebSocketsResponseMocks] = useHttpResponseMock([
         onAbortedMock(handlers, (): HttpResponse => uWebSocketsResponse),
       ]);
 
@@ -1273,7 +1342,7 @@ describe('uwebsockets', () => {
       body.resume();
       await new Promise((resolve) => body.once('end', resolve));
 
-      const [uWebSocketsResponse, uWebSocketsResponseMocks] = useObjectMock<HttpResponse>([
+      const [uWebSocketsResponse, uWebSocketsResponseMocks] = useHttpResponseMock([
         onAbortedMock(handlers, (): HttpResponse => uWebSocketsResponse),
         corkMock((): HttpResponse => uWebSocketsResponse),
         { name: 'writeStatus', parameters: ['200 OK'], returnSelf: true },
@@ -1292,7 +1361,12 @@ describe('uwebsockets', () => {
       expect(uWebSocketsResponseMocks).toHaveLength(0);
     });
 
-    test('with body, with body error', async () => {
+    test.each([
+      // nothing has been sent yet, but the emitter already returned: the caller cannot respond anymore
+      ['collected', 0],
+      // an already started response cannot signal a failure anymore
+      ['streamed', 10],
+    ])('with %s body, with body error', async (_, delay) => {
       const handlers: Handlers = {};
 
       const closed = Promise.withResolvers<undefined>();
@@ -1300,32 +1374,80 @@ describe('uwebsockets', () => {
       const response = createResponse({
         body: (async function* () {
           yield new TextEncoder().encode('partial');
+
+          if (delay > 0) {
+            await wait(delay);
+          }
+
           throw new Error('upstream failed');
         })(),
       });
 
-      const [uWebSocketsResponse, uWebSocketsResponseMocks] = useObjectMock<HttpResponse>([
+      const [uWebSocketsResponse, uWebSocketsResponseMocks] = useHttpResponseMock([
         onAbortedMock(handlers, (): HttpResponse => uWebSocketsResponse),
-        corkMock((): HttpResponse => uWebSocketsResponse),
-        { name: 'writeStatus', parameters: ['200 OK'], returnSelf: true },
-        corkMock((): HttpResponse => uWebSocketsResponse),
-        writeMock('partial', true),
+        ...(delay > 0
+          ? [
+              corkMock((): HttpResponse => uWebSocketsResponse),
+              {
+                name: 'writeStatus',
+                parameters: ['200 OK'],
+                returnSelf: true,
+              } satisfies ObjectMocks<HttpResponse>[number],
+              writeMock('partial', true),
+            ]
+          : []),
         {
           name: 'close',
           callback: (): HttpResponse => {
             closed.resolve(undefined);
+
+            // uWebSockets.js calls the onAborted handler of a closed response
+            handlers.aborted?.();
 
             return uWebSocketsResponse;
           },
         },
       ]);
 
-      const responseToUWebSocketsResponseEmitter = createResponseToUWebSocketsResponseEmitter();
+      // the response send timeout gets cleared: it must not close the response again (a close call would fail with a
+      // missing mock)
+      createResponseToUWebSocketsResponseEmitter(50)(response, uWebSocketsResponse);
 
-      responseToUWebSocketsResponseEmitter(response, uWebSocketsResponse);
-
-      // an already started response cannot signal a failure anymore: the connection gets closed
+      // the response does not get ended as if it was complete: the connection gets closed
       await closed.promise;
+
+      await wait(100);
+
+      expect(uWebSocketsResponseMocks).toHaveLength(0);
+    });
+
+    test('with large body, ending after the current event loop turn', async () => {
+      const handlers: Handlers = {};
+
+      const ended = Promise.withResolvers<undefined>();
+
+      const body = new Readable({ read() {} });
+      body.push(Buffer.alloc(64 * 1024 + 1, 'a'));
+
+      // the streaming starts right away and only once (a second cork call would fail with a mismatch)
+      const [uWebSocketsResponse, uWebSocketsResponseMocks] = useHttpResponseMock([
+        onAbortedMock(handlers, (): HttpResponse => uWebSocketsResponse),
+        corkMock((): HttpResponse => uWebSocketsResponse),
+        { name: 'writeStatus', parameters: ['200 OK'], returnSelf: true },
+        writeMock('a'.repeat(64 * 1024 + 1), true),
+        corkMock((): HttpResponse => uWebSocketsResponse),
+        endMock((): HttpResponse => uWebSocketsResponse, undefined, ended),
+      ]);
+
+      createResponseToUWebSocketsResponseEmitter()(createResponse({ body }), uWebSocketsResponse);
+
+      await wait(20);
+
+      expect(uWebSocketsResponseMocks).toHaveLength(2);
+
+      body.push(null);
+
+      await ended.promise;
 
       expect(uWebSocketsResponseMocks).toHaveLength(0);
     });
@@ -1338,11 +1460,10 @@ describe('uwebsockets', () => {
 
       const response = createResponse({ body });
 
-      const [uWebSocketsResponse, uWebSocketsResponseMocks] = useObjectMock<HttpResponse>([
+      const [uWebSocketsResponse, uWebSocketsResponseMocks] = useHttpResponseMock([
         onAbortedMock(handlers, (): HttpResponse => uWebSocketsResponse),
         corkMock((): HttpResponse => uWebSocketsResponse),
         { name: 'writeStatus', parameters: ['200 OK'], returnSelf: true },
-        corkMock((): HttpResponse => uWebSocketsResponse),
         writeMock('partial', true),
       ]);
 
@@ -1363,6 +1484,75 @@ describe('uwebsockets', () => {
       expect(uWebSocketsResponseMocks).toHaveLength(0);
     });
 
+    test.each([true, false])(
+      'with body, destroying itself with emitting the error %s, with abort',
+      async (emitsError) => {
+        const handlers: Handlers = {};
+
+        const body = new Readable({
+          read() {},
+          destroy(error, callback) {
+            callback(emitsError ? error : null);
+          },
+        });
+        body.on('error', () => {});
+        body.push('partial');
+
+        // the abort happens before the streaming started
+        const [uWebSocketsResponse, uWebSocketsResponseMocks] = useHttpResponseMock([
+          onAbortedMock(handlers, (): HttpResponse => uWebSocketsResponse),
+        ]);
+
+        createResponseToUWebSocketsResponseEmitter(50)(createResponse({ body }), uWebSocketsResponse);
+
+        // uWebSockets.js forbids touching an aborted response: the streaming must not start (a cork call would fail
+        // with a missing mock)
+        handlers.aborted?.();
+
+        await wait(100);
+
+        expect(body.destroyed).toBe(true);
+
+        expect(uWebSocketsResponseMocks).toHaveLength(0);
+      },
+    );
+
+    test.each([true, false])(
+      'with streamed body, destroying itself with emitting the error %s, with abort',
+      async (emitsError) => {
+        const handlers: Handlers = {};
+
+        const body = new Readable({
+          read() {},
+          destroy(error, callback) {
+            callback(emitsError ? error : null);
+          },
+        });
+        body.on('error', () => {});
+        body.push('partial');
+
+        const [uWebSocketsResponse, uWebSocketsResponseMocks] = useHttpResponseMock([
+          onAbortedMock(handlers, (): HttpResponse => uWebSocketsResponse),
+          corkMock((): HttpResponse => uWebSocketsResponse),
+          { name: 'writeStatus', parameters: ['200 OK'], returnSelf: true },
+          writeMock('partial', true),
+        ]);
+
+        createResponseToUWebSocketsResponseEmitter(50)(createResponse({ body }), uWebSocketsResponse);
+
+        await wait(20);
+
+        // the response send timeout must not close the aborted response (a close call would fail with a missing mock)
+        handlers.aborted?.();
+
+        await wait(100);
+
+        expect(body.destroyed).toBe(true);
+
+        expect(uWebSocketsResponseMocks).toHaveLength(0);
+      },
+    );
+
     test('with web stream body, with abort', async () => {
       const handlers: Handlers = {};
 
@@ -1380,11 +1570,10 @@ describe('uwebsockets', () => {
 
       const response = createResponse({ body });
 
-      const [uWebSocketsResponse, uWebSocketsResponseMocks] = useObjectMock<HttpResponse>([
+      const [uWebSocketsResponse, uWebSocketsResponseMocks] = useHttpResponseMock([
         onAbortedMock(handlers, (): HttpResponse => uWebSocketsResponse),
         corkMock((): HttpResponse => uWebSocketsResponse),
         { name: 'writeStatus', parameters: ['200 OK'], returnSelf: true },
-        corkMock((): HttpResponse => uWebSocketsResponse),
         writeMock('partial', true),
       ]);
 
@@ -1410,11 +1599,10 @@ describe('uwebsockets', () => {
 
       const response = createResponse({ body });
 
-      const [uWebSocketsResponse, uWebSocketsResponseMocks] = useObjectMock<HttpResponse>([
+      const [uWebSocketsResponse, uWebSocketsResponseMocks] = useHttpResponseMock([
         onAbortedMock(handlers, (): HttpResponse => uWebSocketsResponse),
         corkMock((): HttpResponse => uWebSocketsResponse),
         { name: 'writeStatus', parameters: ['200 OK'], returnSelf: true },
-        corkMock((): HttpResponse => uWebSocketsResponse),
         writeMock('partial', true),
         {
           name: 'close',
@@ -1433,8 +1621,13 @@ describe('uwebsockets', () => {
 
       responseToUWebSocketsResponseEmitter(response, uWebSocketsResponse);
 
+      // the timeout gets started with the streaming
+      await wait(20);
+
+      const timeoutIndex = setTimeoutSpy.mock.calls.findIndex(([, ms]) => ms === 50);
+
       // the timeout must not keep the process alive
-      expect((setTimeoutSpy.mock.results[0].value as NodeJS.Timeout).hasRef()).toBe(false);
+      expect((setTimeoutSpy.mock.results[timeoutIndex].value as NodeJS.Timeout).hasRef()).toBe(false);
 
       setTimeoutSpy.mockRestore();
 
@@ -1445,33 +1638,59 @@ describe('uwebsockets', () => {
       expect(uWebSocketsResponseMocks).toHaveLength(0);
     });
 
-    test('with body, with response send timeout, with body sent in time', async () => {
+    test('with body, with response send timeout, with body sent at once', async () => {
       const handlers: Handlers = {};
 
       const ended = Promise.withResolvers<undefined>();
 
       const response = createResponse({ body: Readable.from([Buffer.from('complete')]) });
 
-      const [uWebSocketsResponse, uWebSocketsResponseMocks] = useObjectMock<HttpResponse>([
+      const [uWebSocketsResponse, uWebSocketsResponseMocks] = useHttpResponseMock([
         onAbortedMock(handlers, (): HttpResponse => uWebSocketsResponse),
         corkMock((): HttpResponse => uWebSocketsResponse),
         { name: 'writeStatus', parameters: ['200 OK'], returnSelf: true },
+        endMock((): HttpResponse => uWebSocketsResponse, 'complete', ended),
+      ]);
+
+      const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
+
+      createResponseToUWebSocketsResponseEmitter(50)(response, uWebSocketsResponse);
+
+      await ended.promise;
+
+      // a body sent at once does not need a timeout
+      expect(setTimeoutSpy).not.toHaveBeenCalled();
+
+      setTimeoutSpy.mockRestore();
+
+      expect(uWebSocketsResponseMocks).toHaveLength(0);
+    });
+
+    test('with streamed body, with response send timeout, with body sent in time', async () => {
+      const handlers: Handlers = {};
+
+      const ended = Promise.withResolvers<undefined>();
+
+      const body = new Readable({ read() {} });
+      body.push('partial');
+
+      const [uWebSocketsResponse, uWebSocketsResponseMocks] = useHttpResponseMock([
+        onAbortedMock(handlers, (): HttpResponse => uWebSocketsResponse),
+        corkMock((): HttpResponse => uWebSocketsResponse),
+        { name: 'writeStatus', parameters: ['200 OK'], returnSelf: true },
+        writeMock('partial', true),
         corkMock((): HttpResponse => uWebSocketsResponse),
         writeMock('complete', true),
         corkMock((): HttpResponse => uWebSocketsResponse),
-        {
-          name: 'end',
-          callback: (): HttpResponse => {
-            ended.resolve(undefined);
-
-            return uWebSocketsResponse;
-          },
-        },
+        endMock((): HttpResponse => uWebSocketsResponse, undefined, ended),
       ]);
 
-      const responseToUWebSocketsResponseEmitter = createResponseToUWebSocketsResponseEmitter(50);
+      createResponseToUWebSocketsResponseEmitter(50)(createResponse({ body }), uWebSocketsResponse);
 
-      responseToUWebSocketsResponseEmitter(response, uWebSocketsResponse);
+      await wait(20);
+
+      body.push('complete');
+      body.push(null);
 
       await ended.promise;
 

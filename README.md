@@ -37,7 +37,7 @@ injected `UriFactory`, `ServerRequestFactory` and `RequestHelpers` (or `ServerRe
 Through [NPM](https://www.npmjs.com) as [@chubbyts/chubbyts-http-uwebsockets][1].
 
 ```sh
-npm i @chubbyts/chubbyts-http-uwebsockets@^1.1.0
+npm i @chubbyts/chubbyts-http-uwebsockets@^1.1.1
 ```
 
 ## Usage
@@ -119,7 +119,7 @@ provide the optional `withHeaders`) and, except for `GET` and `HEAD`, `withBody`
  * `headers` keep every value of a repeated header (e.g. `cookie`), multiple `authorization` or
    `proxy-authorization` headers get rejected.
  * `protocolVersion` is always `1.1`, uWebSockets.js does not expose the http version.
- * `body` is a `PassThrough` fed by `onData` (an `AsyncIterable<Buffer>`), `GET` and `HEAD` keep the (empty) body of
+ * `body` is a `Readable` fed by `onData` (an `AsyncIterable<Buffer>`), `GET` and `HEAD` keep the (empty) body of
    the factory. Receiving gets paused (backpressure) while the handler does not consume the body, so a fast client
    cannot fill the memory.
  * `signal` gets aborted when the client disconnects (`onAborted`).
@@ -140,9 +140,17 @@ The response to a `HEAD` request and a `1xx`, `204` or `304` response never get 
 the response gets cancelled instead, any byte sent would be read as the start of the next response. For `HEAD` and
 `304` a single valid `content-length` of the handler gets reported (the size of the `GET` response, RFC 9110 8.6).
 
-The body gets streamed with backpressure. A node stream body is used as is and a web stream body gets converted with
-`Readable.fromWeb`, so both get stopped (destroyed / cancelled) when the client disconnects, even while a read is
-pending. Any other `AsyncIterable` can only be stopped once its pending chunk arrives.
+The chunks the body provides within the current event loop turn (e.g. a body created from a string, up to 64 KiB) get
+sent along with the status and the headers at once, with a `content-length`. A body taking longer (or getting larger)
+gets streamed (`transfer-encoding: chunked`) with backpressure, the status and the headers get sent at the latest once
+the current event loop turn is over.
+
+A node stream body is used as is and a web stream body gets converted with `Readable.fromWeb`, so both get stopped
+(destroyed / cancelled) when the client disconnects, even while a read is pending. Any other `AsyncIterable` can only be
+stopped once its pending chunk arrives.
+
+The state shared by the request factory and the emitter (abort, `HEAD`) is attached to the uWebSockets.js
+`HttpResponse` (which allows arbitrary user data to be attached), keyed by a symbol.
 
 ### Timeouts
 
@@ -151,8 +159,9 @@ Slow clients (slowloris) can otherwise tie up sockets indefinitely:
  * `createUWebSocketsRequestToServerRequestFactory(uriFactory, serverRequestFactory, requestHelpers, baseUrl, requestBodyTimeoutMs)`:
    if the request body has not been fully received within the given time, the connection gets closed and the error
    surfaces to the handler while iterating the body.
- * `createResponseToUWebSocketsResponseEmitter(responseSendTimeoutMs)`: if the response has not been fully
-   sent within the given time (slow reading client or stalling response body), the connection gets closed.
+ * `createResponseToUWebSocketsResponseEmitter(responseSendTimeoutMs)`: if a streamed response has not been fully
+   sent within the given time (slow reading client or stalling response body), the connection gets closed. A body
+   sent at once does not need a timeout.
 
 Both timeouts are optional and disabled by default.
 

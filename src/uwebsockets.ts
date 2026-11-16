@@ -28,6 +28,16 @@ const framingHeaderNames = new Set(['content-length', 'transfer-encoding']);
 // RFC 9110 8.6: a content-length announces the size of a GET response for HEAD or 304, a decimal number
 const contentLengthPattern = /^\d+$/;
 
+// setTimeout runs a delay that is not a number from 1 up to 2^31 - 1 (NaN, 0, negative, Infinity) after 1ms: a
+// misconfigured timeout would make every request body / response fail at once instead of being reported
+const maxTimeoutMs = 2 ** 31 - 1;
+
+const assertValidTimeoutMs = (name: string, timeoutMs: number | undefined): void => {
+  if (timeoutMs !== undefined && !(timeoutMs >= 1 && timeoutMs <= maxTimeoutMs)) {
+    throw new Error(`${name} "${timeoutMs}" must be a number from 1 to ${maxTimeoutMs}`);
+  }
+};
+
 // a response body collected within the current event loop turn up to this size gets sent at once (with a
 // content-length), a larger one gets streamed
 const batchMaxBytes = 64 * 1024;
@@ -91,14 +101,28 @@ const resolveUrl = (pathAndQuery: string, origin: string, basePath: string): str
   return url.href;
 };
 
+// a path and a query consisting of these characters only are kept as is by the url parser (WHATWG URL, special
+// scheme): nothing gets percent-encoded, every segment is non-empty (a leading '//' would be protocol-relative) and
+// is no dot segment ('.', '..' also percent-encoded), there is no backslash (a slash for special schemes)
+// Stryker disable next-line Regex: a narrowed pattern (e.g. a single segment) parses more targets, the result is the same
+const plainPathPattern = /^(?:\/(?![./]|%2e)[-!$%&'()*+,.0-9:;=@A-Z_~]+)*\/?$/i;
+// Stryker disable next-line Regex: a narrowed pattern (e.g. a single character) parses more queries, the result is the same
+const plainQueryPattern = /^[-!$%&()*+,./0-9:;=?@A-Z_a-z~]*$/;
+
 // the base url gets parsed once, not per request (its origin is a getter, building the string on every access)
 const createUrlResolver = (baseUrl: string | undefined): ((uWebSocketsRequest: HttpRequest) => string) => {
-  const { origin, pathname } = new URL(baseUrl ?? 'http://127.0.0.1');
+  const { origin, pathname, protocol } = new URL(baseUrl ?? 'http://127.0.0.1');
   const basePath = pathname.replace(/\/$/, '');
+
+  // the uri factory parses the url anyway: a plain request target gets appended without parsing it here as well, for
+  // special schemes only (an opaque origin like the one of 'foo://example.com' is not a valid base)
+  // Stryker disable next-line ConditionalExpression,LogicalOperator,StringLiteral: excluding http or https parses more targets, the result is the same
+  const isPlainOrigin = protocol === 'http:' || protocol === 'https:';
 
   return (uWebSocketsRequest: HttpRequest): string => {
     const query = uWebSocketsRequest.getQuery();
-    const pathAndQuery = uWebSocketsRequest.getUrl() + (query ? `?${query}` : '');
+    const path = uWebSocketsRequest.getUrl();
+    const pathAndQuery = path + (query ? `?${query}` : '');
 
     // only origin-form request targets can be safely appended after a host: absolute-form
     // ('http://evil.com/path'), authority-form and asterisk-form targets would end up within
@@ -109,6 +133,11 @@ const createUrlResolver = (baseUrl: string | undefined): ((uWebSocketsRequest: H
       );
     }
 
+    // Stryker disable next-line ConditionalExpression,LogicalOperator,BlockStatement: parsing a plain target as well results in the same, only slower
+    if (isPlainOrigin && plainPathPattern.test(path) && (!query || plainQueryPattern.test(query))) {
+      return origin + basePath + pathAndQuery;
+    }
+
     return resolveUrl(pathAndQuery, origin, basePath);
   };
 };
@@ -116,16 +145,24 @@ const createUrlResolver = (baseUrl: string | undefined): ((uWebSocketsRequest: H
 export const getUrl = (uWebSocketsRequest: HttpRequest, baseUrl: string | undefined = undefined): string =>
   createUrlResolver(baseUrl)(uWebSocketsRequest);
 
-const uWebSocketsRequestToHeaders = (uWebSocketsRequest: HttpRequest): Map<string, Array<string>> => {
-  // a map instead of an object: a header named '__proto__' must not change the prototype
-  const headers = new Map<string, Array<string>>();
+const uWebSocketsRequestToHeaders = (uWebSocketsRequest: HttpRequest): Record<string, Array<string>> => {
+  // a plain object instead of a map converted by Object.fromEntries (the conversion took a tenth of the request
+  // handling), not one without prototype either (it is in dictionary mode, slowing down the helpers using it)
+  const headers: Record<string, Array<string>> = {};
 
   // uWebSockets.js provides the header names lowercased
   uWebSocketsRequest.forEach((name, value) => {
-    const values = headers.get(name);
-
-    if (!values) {
-      headers.set(name, [value]);
+    // own properties only: a header named like an inherited property ('constructor') must not find the inherited one
+    if (!Object.hasOwn(headers, name)) {
+      // an assigned '__proto__' would change the prototype instead of defining a header
+      // Stryker disable next-line ConditionalExpression: defining every header results in the same, only slower
+      if (name === '__proto__') {
+        // oxlint-disable-next-line functional/immutable-data
+        Object.defineProperty(headers, name, { value: [value], enumerable: true, writable: true, configurable: true });
+      } else {
+        // oxlint-disable-next-line functional/immutable-data
+        headers[name] = [value];
+      }
 
       return;
     }
@@ -136,7 +173,7 @@ const uWebSocketsRequestToHeaders = (uWebSocketsRequest: HttpRequest): Map<strin
 
     // duplicate headers (cookie included) are kept as separate values, the helpers decide how to combine them
     // oxlint-disable-next-line functional/immutable-data
-    values.push(value);
+    headers[name].push(value);
   });
 
   return headers;
@@ -149,7 +186,11 @@ const getBody = (
   requestBodyTimeoutMs: number | undefined,
   requestBodyMaxBytes: number | undefined,
 ): Body => {
-  const received = { bytes: 0, paused: false };
+  const received: { bytes: number; paused: boolean; timeout: NodeJS.Timeout | undefined } = {
+    bytes: 0,
+    paused: false,
+    timeout: undefined,
+  };
 
   // a readable fed by onData instead of a passthrough: a passthrough is a writable and a readable, each chunk passes
   // both sides. Reading the body resumes the receiving paused on backpressure.
@@ -170,6 +211,7 @@ const getBody = (
   // a disconnecting client would otherwise leave the body open forever: a pending
   // read of the request body has to fail instead of hanging
   addAbortListener(abortState, () => {
+    clearTimeout(received.timeout);
     body.destroy(new Error('Request has been aborted'));
   });
 
@@ -197,7 +239,8 @@ const getBody = (
 
   // slowloris protection: a client sending the body arbitrarily slow would otherwise keep the
   // request (and its socket) alive forever
-  const timeout =
+  // oxlint-disable-next-line functional/immutable-data
+  received.timeout =
     requestBodyTimeoutMs !== undefined
       ? setTimeout(() => {
           failBody(new Error(`Request body has not been fully received within ${requestBodyTimeoutMs}ms`));
@@ -210,7 +253,7 @@ const getBody = (
 
     // a chunked body (or one with a wrong content-length) is limited while receiving it
     if (received.bytes > maxBytes) {
-      clearTimeout(timeout);
+      clearTimeout(received.timeout);
       failBody(maxBytesError());
 
       return;
@@ -226,7 +269,7 @@ const getBody = (
     }
 
     if (isLast) {
-      clearTimeout(timeout);
+      clearTimeout(received.timeout);
       // oxlint-disable-next-line functional/immutable-data
       body.push(null);
     }
@@ -254,6 +297,8 @@ export const createUWebSocketsRequestToServerRequestFactory = (
   if (Number.isNaN(requestBodyMaxBytes) || (requestBodyMaxBytes ?? 0) < 0) {
     throw new Error(`Request body max bytes "${requestBodyMaxBytes}" must be a non-negative number`);
   }
+
+  assertValidTimeoutMs('Request body timeout ms', requestBodyTimeoutMs);
 
   const resolveRequestUrl = createUrlResolver(baseUrl);
 
@@ -284,11 +329,10 @@ export const createUWebSocketsRequestToServerRequestFactory = (
 
     const serverRequestWithSignal = requestHelpers.withSignal(createdServerRequest, abortController.signal);
 
-    // Object.fromEntries defines own properties: a header named '__proto__' does not change the prototype
     const serverRequest = withHeaders
-      ? withHeaders(serverRequestWithSignal, Object.fromEntries(headers))
-      : [...headers].reduce(
-          (request, [name, values]) => requestHelpers.withHeader(request, name, values),
+      ? withHeaders(serverRequestWithSignal, headers)
+      : Object.keys(headers).reduce(
+          (request, name) => requestHelpers.withHeader(request, name, headers[name]),
           serverRequestWithSignal,
         );
 
@@ -302,7 +346,7 @@ export const createUWebSocketsRequestToServerRequestFactory = (
       getBody(
         uWebSocketsResponse,
         abortState,
-        headers.get('content-length')?.[0],
+        headers['content-length']?.[0],
         requestBodyTimeoutMs,
         requestBodyMaxBytes,
       ),
@@ -347,12 +391,21 @@ const getInvalidResponseReason = (response: Response): string | undefined => {
 
   const { headers } = response;
 
-  const invalidHeaderName = Object.keys(headers).find(
-    (name) => !tokenPattern.test(name) || headers[name].some((value) => !fieldValuePattern.test(value)),
-  );
+  // loops instead of find and some: no closures per response
+  for (const name of Object.keys(headers)) {
+    if (!tokenPattern.test(name)) {
+      return `Invalid response header "${name}"`;
+    }
 
-  // the value is not part of the reason: it may contain the injected content
-  return invalidHeaderName !== undefined ? `Invalid response header "${invalidHeaderName}"` : undefined;
+    for (const value of headers[name]) {
+      // the value is not part of the reason: it may contain the injected content
+      if (!fieldValuePattern.test(value)) {
+        return `Invalid response header "${name}"`;
+      }
+    }
+  }
+
+  return undefined;
 };
 
 // RFC 9112 6.3: the response to a HEAD request and a 1xx, 204 or 304 response end with the header section, any byte
@@ -515,6 +568,8 @@ type ResponseToUWebSocketsResponseEmitter = (response: Response, uWebSocketsResp
 export const createResponseToUWebSocketsResponseEmitter = (
   responseSendTimeoutMs: number | undefined = undefined,
 ): ResponseToUWebSocketsResponseEmitter => {
+  assertValidTimeoutMs('Response send timeout ms', responseSendTimeoutMs);
+
   return (response: Response, uWebSocketsResponse: HttpResponse): void => {
     const abortState = getAbortState(uWebSocketsResponse);
 
@@ -550,6 +605,20 @@ export const createResponseToUWebSocketsResponseEmitter = (
         } else {
           uWebSocketsResponse.endWithoutBody();
         }
+      });
+
+      return;
+    }
+
+    // RFC 9110 15.3.6: a 205 response must not have content, but unlike a 204 one it does not end with the header
+    // section (RFC 9112 6.3): the body of the handler gets replaced by an empty one, uWebSockets.js reports a
+    // content-length of 0 (without it, the client would read until the connection gets closed)
+    if (response.status === 205) {
+      cancelBody(response.body);
+
+      uWebSocketsResponse.cork(() => {
+        writeStatusAndHeaders(response, uWebSocketsResponse);
+        uWebSocketsResponse.end();
       });
 
       return;

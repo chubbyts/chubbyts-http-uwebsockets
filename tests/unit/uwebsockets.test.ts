@@ -77,6 +77,16 @@ const useImplementationMocks = (
             // set at once, grouped by name, in the order of the first occurrence
             expect(Object.entries(headers)).toEqual(expected?.headers ?? []);
 
+            // ordinary data properties (a header named '__proto__' included)
+            Object.values(Object.getOwnPropertyDescriptors(headers)).forEach((descriptor) => {
+              expect(descriptor).toEqual({
+                value: expect.any(Array),
+                enumerable: true,
+                writable: true,
+                configurable: true,
+              });
+            });
+
             return {
               ...message,
               headers: { ...message.headers, ...(headers as Readonly<Record<string, ReadonlyArray<string>>>) },
@@ -271,6 +281,36 @@ describe('uwebsockets', () => {
       ['/path/to/route', '', 'https://example.com/', 'https://example.com/path/to/route'],
       ['/path/to/route', 'key=value', 'https://example.com/app', 'https://example.com/app/path/to/route?key=value'],
       ['/path/to/route', '', 'https://example.com/app/', 'https://example.com/app/path/to/route'],
+      ['/', '', 'https://example.com/app/', 'https://example.com/app/'],
+      ['/path/to/route/', '', 'https://example.com', 'https://example.com/path/to/route/'],
+      // not appended as is: normalized by the url parser
+      ['/path/./to/../route', '', 'https://example.com', 'https://example.com/path/route'],
+      ['/path/%2e%2E/route', '', 'https://example.com', 'https://example.com/route'],
+      ['/path/.hidden', '', 'https://example.com', 'https://example.com/path/.hidden'],
+      ['/..', '', 'https://example.com', 'https://example.com/'],
+      ['/<>', "<'>", 'https://example.com', 'https://example.com/%3C%3E?%3C%27%3E'],
+      ['/path//to/route', '', 'https://example.com/app', 'https://example.com/app/path//to/route'],
+      ['/path to/"route"', '', 'https://example.com', 'https://example.com/path%20to/%22route%22'],
+      ['/path/to/route', "key='value'", 'https://example.com', 'https://example.com/path/to/route?key=%27value%27'],
+      [
+        '/path/to/route',
+        'key=value#fragment',
+        'https://example.com',
+        'https://example.com/path/to/route?key=value#fragment',
+      ],
+      ['/päth', 'kéy=välue', 'https://example.com', 'https://example.com/p%C3%A4th?k%C3%A9y=v%C3%A4lue'],
+      [
+        '/path/to/route',
+        'key=value',
+        'wss://example.com:8443/app',
+        'wss://example.com:8443/app/path/to/route?key=value',
+      ],
+      [
+        '/path/to/route',
+        'key=value',
+        'HTTPS://user:password@EXAMPLE.com:443/app',
+        'https://example.com/app/path/to/route?key=value',
+      ],
     ])('with url "%s", with query "%s", with base url "%s"', (url, query, baseUrl, expected) => {
       const [uWebSocketsRequest, uWebSocketsRequestMocks] = useObjectMock<HttpRequest>([
         { name: 'getQuery', callback: (() => query) as HttpRequest['getQuery'] },
@@ -306,6 +346,18 @@ describe('uwebsockets', () => {
 
       expect(uWebSocketsRequestMocks).toHaveLength(0);
     });
+
+    test('with a base url with an opaque origin', () => {
+      const [uWebSocketsRequest, uWebSocketsRequestMocks] = useObjectMock<HttpRequest>([
+        { name: 'getQuery', callback: (() => '') as HttpRequest['getQuery'] },
+        { name: 'getUrl', parameters: [], return: '/path/to/route' },
+      ]);
+
+      // not a valid base url: must not be appended to as if it was one
+      expect(() => getUrl(uWebSocketsRequest, 'foo://example.com')).toThrow('Invalid URL');
+
+      expect(uWebSocketsRequestMocks).toHaveLength(0);
+    });
   });
 
   describe('createUWebSocketsRequestToServerRequestFactory', () => {
@@ -322,6 +374,9 @@ describe('uwebsockets', () => {
           ['authorization', 'Bearer token1'],
           // a valid token: must neither change the prototype of the headers nor get lost
           ['__proto__', 'value'],
+          // named like inherited properties: must not be mistaken for an already received header
+          ['constructor', 'value1'],
+          ['constructor', 'value2'],
         ]),
       );
 
@@ -340,6 +395,7 @@ describe('uwebsockets', () => {
             ['cookie', ['sessionId=abc123', 'ui_lang=en-US']],
             ['authorization', ['Bearer token1']],
             ['__proto__', ['value']],
+            ['constructor', ['value1', 'value2']],
           ],
         },
         withHeaders,
@@ -365,6 +421,10 @@ describe('uwebsockets', () => {
           ],
           "authorization": [
             "Bearer token1",
+          ],
+          "constructor": [
+            "value1",
+            "value2",
           ],
           "content-type": [
             "text/plain",
@@ -667,9 +727,20 @@ describe('uwebsockets', () => {
         50,
       );
 
+      const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
+      const clearTimeoutSpy = vi.spyOn(globalThis, 'clearTimeout');
+
       const serverRequest = uWebSocketsRequestToServerRequestFactory(uWebSocketsRequest, uWebSocketsResponse);
 
+      const timeout = setTimeoutSpy.mock.results[setTimeoutSpy.mock.calls.findIndex(([, ms]) => ms === 50)].value;
+
       handlers.aborted?.();
+
+      // the timeout gets cleared with the abort, not left to run
+      expect(clearTimeoutSpy).toHaveBeenCalledWith(timeout);
+
+      setTimeoutSpy.mockRestore();
+      clearTimeoutSpy.mockRestore();
 
       // uWebSockets.js forbids touching an aborted response: the timeout must not close it (a close call would fail
       // with a missing mock)
@@ -835,6 +906,53 @@ describe('uwebsockets', () => {
       expectAllMocksCalled(mocks);
     });
 
+    test('with body, with request body max bytes, with too large content-length, with already aborted response', async () => {
+      const handlers: Handlers = {};
+
+      const [uWebSocketsRequest, uWebSocketsRequestMocks] = useObjectMock<HttpRequest>([
+        ...requestMocks('get', '/path/to/route', ''),
+        ...requestMocks('post', '/path/to/route', '', [['content-length', '11']]),
+      ]);
+
+      // uWebSockets.js forbids touching an aborted response: no close (a close call would fail with a missing mock)
+      const [uWebSocketsResponse, uWebSocketsResponseMocks] = useHttpResponseMock([
+        onAbortedMock(handlers, (): HttpResponse => uWebSocketsResponse),
+      ]);
+
+      const firstImplementation = useImplementationMocks({ url: 'http://127.0.0.1/path/to/route', method: 'GET' });
+      const secondImplementation = useImplementationMocks({
+        url: 'http://127.0.0.1/path/to/route',
+        method: 'POST',
+        headers: [['content-length', ['11']]],
+        withBody: true,
+      });
+
+      createUWebSocketsRequestToServerRequestFactory(
+        firstImplementation.uriFactory,
+        firstImplementation.serverRequestFactory,
+        firstImplementation.requestHelpers,
+      )(uWebSocketsRequest, uWebSocketsResponse);
+
+      handlers.aborted?.();
+
+      const serverRequest = createUWebSocketsRequestToServerRequestFactory(
+        secondImplementation.uriFactory,
+        secondImplementation.serverRequestFactory,
+        secondImplementation.requestHelpers,
+        undefined,
+        50,
+        10,
+      )(uWebSocketsRequest, uWebSocketsResponse);
+
+      expect(serverRequest.signal.aborted).toBe(true);
+      await expect(text(serverRequest.body)).rejects.toThrow('Request has been aborted');
+
+      expect(uWebSocketsRequestMocks).toHaveLength(0);
+      expect(uWebSocketsResponseMocks).toHaveLength(0);
+      expectAllMocksCalled(firstImplementation.mocks);
+      expectAllMocksCalled(secondImplementation.mocks);
+    });
+
     test('with body, with request body max bytes, with too large received body', async () => {
       const handlers: Handlers = {};
 
@@ -902,6 +1020,48 @@ describe('uwebsockets', () => {
       expect(requestHelpersMocks).toHaveLength(0);
     });
 
+    test.each([NaN, 0, -1, 0.5, Infinity, 2 ** 31])('with invalid request body timeout ms %s', (timeoutMs) => {
+      const [uriFactory, uriFactoryMocks] = useFunctionMock<UriFactory>([]);
+      const [serverRequestFactory, serverRequestFactoryMocks] = useFunctionMock<ServerRequestFactory>([]);
+      const [requestHelpers, requestHelpersMocks] = useObjectMock<RequestHelpers>([]);
+
+      expect(() =>
+        createUWebSocketsRequestToServerRequestFactory(
+          uriFactory,
+          serverRequestFactory,
+          requestHelpers,
+          undefined,
+          timeoutMs,
+        ),
+      ).toThrow(`Request body timeout ms "${timeoutMs}" must be a number from 1 to 2147483647`);
+
+      expect(uriFactoryMocks).toHaveLength(0);
+      expect(serverRequestFactoryMocks).toHaveLength(0);
+      expect(requestHelpersMocks).toHaveLength(0);
+    });
+
+    test.each([1, 1.5, 2 ** 31 - 1])('with valid request body timeout ms %s', (timeoutMs) => {
+      const [uriFactory, uriFactoryMocks] = useFunctionMock<UriFactory>([]);
+      const [serverRequestFactory, serverRequestFactoryMocks] = useFunctionMock<ServerRequestFactory>([]);
+      const [requestHelpers, requestHelpersMocks] = useObjectMock<RequestHelpers>([
+        { name: 'withHeaders', value: undefined },
+      ]);
+
+      expect(
+        createUWebSocketsRequestToServerRequestFactory(
+          uriFactory,
+          serverRequestFactory,
+          requestHelpers,
+          undefined,
+          timeoutMs,
+        ),
+      ).toBeTypeOf('function');
+
+      expect(uriFactoryMocks).toHaveLength(0);
+      expect(serverRequestFactoryMocks).toHaveLength(0);
+      expect(requestHelpersMocks).toHaveLength(0);
+    });
+
     // accepted before the validation got added: kept for backward compatibility
     test.each([0, 1.5, Infinity])('with valid request body max bytes %s', (requestBodyMaxBytes) => {
       const [uriFactory, uriFactoryMocks] = useFunctionMock<UriFactory>([]);
@@ -928,6 +1088,50 @@ describe('uwebsockets', () => {
   });
 
   describe('createResponseToUWebSocketsResponseEmitter', () => {
+    test.each([NaN, 0, -1, 0.5, Infinity, 2 ** 31])('with invalid response send timeout ms %s', (timeoutMs) => {
+      expect(() => createResponseToUWebSocketsResponseEmitter(timeoutMs)).toThrow(
+        `Response send timeout ms "${timeoutMs}" must be a number from 1 to 2147483647`,
+      );
+    });
+
+    test.each([1, 1.5, 2 ** 31 - 1])('with valid response send timeout ms %s', (timeoutMs) => {
+      expect(createResponseToUWebSocketsResponseEmitter(timeoutMs)).toBeTypeOf('function');
+    });
+
+    // RFC 9110 15.3.6: no content, but a content-length of 0 (a 205 response does not end with the header section)
+    test('with reset content response', async () => {
+      const handlers: Handlers = {};
+
+      const body = Readable.from([Buffer.from('content')]);
+
+      const [uWebSocketsResponse, uWebSocketsResponseMocks] = useHttpResponseMock([
+        onAbortedMock(handlers, (): HttpResponse => uWebSocketsResponse),
+        corkMock((): HttpResponse => uWebSocketsResponse),
+        { name: 'writeStatus', parameters: ['205 Reset Content'], returnSelf: true },
+        { name: 'writeHeader', parameters: ['etag', '"abc"'], returnSelf: true },
+        { name: 'end', parameters: [], returnSelf: true },
+      ]);
+
+      createResponseToUWebSocketsResponseEmitter(50)(
+        createResponse({
+          status: 205,
+          reasonPhrase: 'Reset Content',
+          headers: { etag: ['"abc"'], 'content-length': ['7'] },
+          body,
+        }),
+        uWebSocketsResponse,
+      );
+
+      // no timeout gets started (a close call would fail with a missing mock)
+      await wait(100);
+
+      // the body does not get read but cancelled
+      expect(body.destroyed).toBe(true);
+      expect(body.readableEnded).toBe(false);
+
+      expect(uWebSocketsResponseMocks).toHaveLength(0);
+    });
+
     test('with body', async () => {
       const handlers: Handlers = {};
 

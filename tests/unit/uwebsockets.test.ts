@@ -1,6 +1,6 @@
 /* oxlint-disable functional/immutable-data */
 
-import { Readable } from 'node:stream';
+import { PassThrough, Readable } from 'node:stream';
 import { text } from 'node:stream/consumers';
 import { describe, expect, test, vi } from 'vitest';
 import type { HttpRequest, HttpResponse } from 'uWebSockets.js';
@@ -336,6 +336,19 @@ describe('uwebsockets', () => {
         'Unsupported request target "http://evil.com/path/to/route": only origin-form (starting with "/") is supported',
       ],
       ['*', 'Unsupported request target "*": only origin-form (starting with "/") is supported'],
+      // same origin, but with injected userinfo
+      [
+        '//user@example.com/path/to/route',
+        'Request target "//user@example.com/path/to/route" must not contain userinfo',
+      ],
+      [
+        '//user:password@example.com/path/to/route',
+        'Request target "//user:password@example.com/path/to/route" must not contain userinfo',
+      ],
+      [
+        '//:password@example.com/path/to/route',
+        'Request target "//:password@example.com/path/to/route" must not contain userinfo',
+      ],
     ])('with request target "%s"', (url, expected) => {
       const [uWebSocketsRequest, uWebSocketsRequestMocks] = useObjectMock<HttpRequest>([
         { name: 'getQuery', callback: (() => '') as HttpRequest['getQuery'] },
@@ -999,6 +1012,425 @@ describe('uwebsockets', () => {
       expectAllMocksCalled(mocks);
     });
 
+    test.each([
+      [
+        'without content',
+        () => createResponse({ status: 204, reasonPhrase: 'No Content' }),
+        (getResponse: () => HttpResponse): ObjectMocks<HttpResponse> => [
+          corkMock(getResponse),
+          { name: 'writeStatus', parameters: ['204 No Content'], returnSelf: true },
+          { name: 'resume', parameters: [], return: undefined },
+          { name: 'endWithoutBody', parameters: [], callback: getResponse },
+        ],
+      ],
+      [
+        'with reset content',
+        () => createResponse({ status: 205, reasonPhrase: 'Reset Content' }),
+        (getResponse: () => HttpResponse): ObjectMocks<HttpResponse> => [
+          corkMock(getResponse),
+          { name: 'writeStatus', parameters: ['205 Reset Content'], returnSelf: true },
+          { name: 'resume', parameters: [], return: undefined },
+          endMock(getResponse, undefined),
+        ],
+      ],
+      [
+        'with already ended body',
+        async () => {
+          const body = Readable.from([]);
+          body.resume();
+          await new Promise((resolve) => body.once('end', resolve));
+
+          return createResponse({ status: 401, reasonPhrase: 'Unauthorized', body });
+        },
+        (getResponse: () => HttpResponse): ObjectMocks<HttpResponse> => [
+          corkMock(getResponse),
+          { name: 'writeStatus', parameters: ['401 Unauthorized'], returnSelf: true },
+          { name: 'resume', parameters: [], return: undefined },
+          endMock(getResponse, undefined),
+        ],
+      ],
+      [
+        'with collected body',
+        () => createResponse({ status: 401, reasonPhrase: 'Unauthorized', body: Readable.from(['Unauthorized']) }),
+        (getResponse: () => HttpResponse): ObjectMocks<HttpResponse> => [
+          corkMock(getResponse),
+          { name: 'writeStatus', parameters: ['401 Unauthorized'], returnSelf: true },
+          { name: 'resume', parameters: [], return: undefined },
+          endMock(getResponse, 'Unauthorized'),
+        ],
+      ],
+      [
+        'with streamed body',
+        () =>
+          createResponse({
+            status: 401,
+            reasonPhrase: 'Unauthorized',
+            body: (async function* () {
+              yield Buffer.from('Unauth');
+              await wait(10);
+              yield Buffer.from('orized');
+            })(),
+          }),
+        (getResponse: () => HttpResponse): ObjectMocks<HttpResponse> => [
+          corkMock(getResponse),
+          { name: 'writeStatus', parameters: ['401 Unauthorized'], returnSelf: true },
+          writeMock('Unauth', true),
+          corkMock(getResponse),
+          writeMock('orized', true),
+          corkMock(getResponse),
+          { name: 'resume', parameters: [], return: undefined },
+          endMock(getResponse, undefined),
+        ],
+      ],
+    ])(
+      'with body, with backpressure, with response %s sent before the body got read',
+      async (_, createHandlerResponse, emitterMocks) => {
+        const handlers: Handlers = {};
+
+        const [uWebSocketsRequest, uWebSocketsRequestMocks] = useObjectMock<HttpRequest>(
+          requestMocks('post', '/path/to/route', ''),
+        );
+
+        // the response gets ended while receiving the body is paused: it has to be resumed before (the connection
+        // would hang otherwise), uWebSockets.js forbids touching the ended response (a pause or close call would fail
+        // with a missing mock)
+        const [uWebSocketsResponse, uWebSocketsResponseMocks] = useHttpResponseMock([
+          onAbortedMock(handlers, (): HttpResponse => uWebSocketsResponse),
+          onDataMock(handlers, (): HttpResponse => uWebSocketsResponse),
+          { name: 'pause', parameters: [], return: undefined },
+          ...emitterMocks((): HttpResponse => uWebSocketsResponse),
+        ]);
+
+        const { uriFactory, serverRequestFactory, requestHelpers, mocks } = useImplementationMocks({
+          url: 'http://127.0.0.1/path/to/route',
+          method: 'POST',
+          withBody: true,
+        });
+
+        const serverRequest = createUWebSocketsRequestToServerRequestFactory(
+          uriFactory,
+          serverRequestFactory,
+          requestHelpers,
+          undefined,
+          100,
+          1024 * 1024,
+        )(uWebSocketsRequest, uWebSocketsResponse);
+
+        // exceeds the high water mark of the body: receiving gets paused
+        handlers.data?.(toArrayBuffer('a'.repeat(128 * 1024)), false);
+
+        // the handler does not read the body (e.g. an unauthorized request)
+        createResponseToUWebSocketsResponseEmitter()(await createHandlerResponse(), uWebSocketsResponse);
+
+        await wait(30);
+
+        expect(uWebSocketsResponseMocks).toHaveLength(0);
+
+        // uWebSockets.js keeps on receiving the body: it gets discarded, even beyond the limit (a pause or a close call
+        // would fail with a missing mock)
+        handlers.data?.(toArrayBuffer('b'.repeat(1024 * 1024)), false);
+        handlers.data?.(toArrayBuffer('c'), true);
+
+        // the request body timeout got cleared: it must not close the ended response
+        await wait(150);
+
+        await expect(text(serverRequest.body)).rejects.toThrow(
+          'Request body has been discarded, the response has been sent without reading it',
+        );
+
+        expect(serverRequest.signal.aborted).toBe(false);
+
+        expect(uWebSocketsRequestMocks).toHaveLength(0);
+        expect(uWebSocketsResponseMocks).toHaveLength(0);
+        expectAllMocksCalled(mocks);
+      },
+    );
+
+    test.each([
+      ['a data listener', (body: Body) => text(body)],
+      ['a pipe', (body: Body) => text((body as Readable).pipe(new PassThrough()))],
+      [
+        'a manual read',
+        async (body: Body) => {
+          const readable = body as Readable;
+          const chunks: Array<Buffer> = [readable.read() as Buffer];
+
+          await new Promise((resolve) =>
+            readable.on('end', resolve).on('readable', () => {
+              // oxlint-disable-next-line functional/no-loop-statements, functional/no-let
+              for (let chunk = readable.read(); chunk !== null; chunk = readable.read()) {
+                chunks.push(chunk as Buffer);
+              }
+            }),
+          );
+
+          return Buffer.concat(chunks).toString();
+        },
+      ],
+    ])(
+      'with body, with backpressure, with response sent before the body got received, still read by %s',
+      async (_, read) => {
+        const handlers: Handlers = {};
+
+        const [uWebSocketsRequest, uWebSocketsRequestMocks] = useObjectMock<HttpRequest>(
+          requestMocks('post', '/path/to/route', ''),
+        );
+
+        // receiving gets resumed before the response gets ended, it cannot be paused anymore afterwards (a pause call
+        // would fail with a missing mock)
+        const [uWebSocketsResponse, uWebSocketsResponseMocks] = useHttpResponseMock([
+          onAbortedMock(handlers, (): HttpResponse => uWebSocketsResponse),
+          onDataMock(handlers, (): HttpResponse => uWebSocketsResponse),
+          { name: 'pause', parameters: [], return: undefined },
+          corkMock((): HttpResponse => uWebSocketsResponse),
+          { name: 'writeStatus', parameters: ['202 Accepted'], returnSelf: true },
+          { name: 'resume', parameters: [], return: undefined },
+          endMock((): HttpResponse => uWebSocketsResponse, ''),
+        ]);
+
+        const { uriFactory, serverRequestFactory, requestHelpers, mocks } = useImplementationMocks({
+          url: 'http://127.0.0.1/path/to/route',
+          method: 'POST',
+          withBody: true,
+        });
+
+        const serverRequest = createUWebSocketsRequestToServerRequestFactory(
+          uriFactory,
+          serverRequestFactory,
+          requestHelpers,
+          undefined,
+          100,
+          1024 * 1024,
+        )(uWebSocketsRequest, uWebSocketsResponse);
+
+        const largeChunk = 'a'.repeat(128 * 1024);
+
+        // exceeds the high water mark of the body: receiving gets paused
+        handlers.data?.(toArrayBuffer(largeChunk), false);
+
+        // the handler responds before the body has been received, but keeps on reading it
+        createResponseToUWebSocketsResponseEmitter()(
+          createResponse({ status: 202, reasonPhrase: 'Accepted' }),
+          uWebSocketsResponse,
+        );
+
+        // the response gets sent once the current event loop turn is over
+        await wait(10);
+
+        expect(uWebSocketsResponseMocks).toHaveLength(0);
+
+        const content = read(serverRequest.body);
+
+        // exceeding the high water mark does not pause anymore
+        handlers.data?.(toArrayBuffer(largeChunk), false);
+        handlers.data?.(toArrayBuffer(largeChunk), false);
+        handlers.data?.(toArrayBuffer('b'), true);
+
+        expect(await content).toBe(largeChunk + largeChunk + largeChunk + 'b');
+
+        // the request body timeout got cleared: it must not close the ended response
+        await wait(150);
+
+        expect(serverRequest.signal.aborted).toBe(false);
+
+        expect(uWebSocketsRequestMocks).toHaveLength(0);
+        expect(uWebSocketsResponseMocks).toHaveLength(0);
+        expectAllMocksCalled(mocks);
+      },
+    );
+
+    test('with body, with request body max bytes, with response sent before the body got received, still read', async () => {
+      const handlers: Handlers = {};
+
+      const [uWebSocketsRequest, uWebSocketsRequestMocks] = useObjectMock<HttpRequest>(
+        requestMocks('post', '/path/to/route', ''),
+      );
+
+      // the limit still applies, but the ended response cannot be closed anymore (a close call would fail with a
+      // missing mock)
+      const [uWebSocketsResponse, uWebSocketsResponseMocks] = useHttpResponseMock([
+        onAbortedMock(handlers, (): HttpResponse => uWebSocketsResponse),
+        onDataMock(handlers, (): HttpResponse => uWebSocketsResponse),
+        corkMock((): HttpResponse => uWebSocketsResponse),
+        { name: 'writeStatus', parameters: ['202 Accepted'], returnSelf: true },
+        endMock((): HttpResponse => uWebSocketsResponse, ''),
+      ]);
+
+      const { uriFactory, serverRequestFactory, requestHelpers, mocks } = useImplementationMocks({
+        url: 'http://127.0.0.1/path/to/route',
+        method: 'POST',
+        withBody: true,
+      });
+
+      const serverRequest = createUWebSocketsRequestToServerRequestFactory(
+        uriFactory,
+        serverRequestFactory,
+        requestHelpers,
+        undefined,
+        undefined,
+        10,
+      )(uWebSocketsRequest, uWebSocketsResponse);
+
+      createResponseToUWebSocketsResponseEmitter()(
+        createResponse({ status: 202, reasonPhrase: 'Accepted' }),
+        uWebSocketsResponse,
+      );
+
+      // the response gets sent once the current event loop turn is over
+      await wait(10);
+
+      expect(uWebSocketsResponseMocks).toHaveLength(0);
+
+      const content = text(serverRequest.body);
+
+      handlers.data?.(toArrayBuffer('0123456789'), false);
+      handlers.data?.(toArrayBuffer('a'), false);
+
+      // the rest gets discarded
+      handlers.data?.(toArrayBuffer('b'), true);
+
+      await expect(content).rejects.toThrow('Request body exceeds the maximum of 10 bytes');
+
+      expect(uWebSocketsRequestMocks).toHaveLength(0);
+      expect(uWebSocketsResponseMocks).toHaveLength(0);
+      expectAllMocksCalled(mocks);
+    });
+
+    test('with body, with request body timeout, with response sent before the body got received', async () => {
+      const handlers: Handlers = {};
+
+      const [uWebSocketsRequest, uWebSocketsRequestMocks] = useObjectMock<HttpRequest>(
+        requestMocks('post', '/path/to/route', ''),
+      );
+
+      // not paused: the ended response does not get resumed (a resume call would fail with a missing mock)
+      const [uWebSocketsResponse, uWebSocketsResponseMocks] = useHttpResponseMock([
+        onAbortedMock(handlers, (): HttpResponse => uWebSocketsResponse),
+        onDataMock(handlers, (): HttpResponse => uWebSocketsResponse),
+        corkMock((): HttpResponse => uWebSocketsResponse),
+        { name: 'writeStatus', parameters: ['204 No Content'], returnSelf: true },
+        { name: 'endWithoutBody', parameters: [], returnSelf: true },
+      ]);
+
+      const { uriFactory, serverRequestFactory, requestHelpers, mocks } = useImplementationMocks({
+        url: 'http://127.0.0.1/path/to/route',
+        method: 'POST',
+        withBody: true,
+      });
+
+      const serverRequest = createUWebSocketsRequestToServerRequestFactory(
+        uriFactory,
+        serverRequestFactory,
+        requestHelpers,
+        undefined,
+        50,
+      )(uWebSocketsRequest, uWebSocketsResponse);
+
+      handlers.data?.(toArrayBuffer('partial'), false);
+
+      createResponseToUWebSocketsResponseEmitter()(
+        createResponse({ status: 204, reasonPhrase: 'No Content' }),
+        uWebSocketsResponse,
+      );
+
+      // the timeout fails the body, but must not close the ended response (a close call would fail with a missing mock)
+      await wait(100);
+
+      await expect(text(serverRequest.body)).rejects.toThrow('Request body has not been fully received within 50ms');
+
+      // uWebSockets.js keeps on receiving the body: it gets discarded
+      handlers.data?.(toArrayBuffer('rest'), true);
+
+      expect(uWebSocketsRequestMocks).toHaveLength(0);
+      expect(uWebSocketsResponseMocks).toHaveLength(0);
+      expectAllMocksCalled(mocks);
+    });
+
+    test('with body, with last chunk received after the response got sent', async () => {
+      const handlers: Handlers = {};
+
+      const [uWebSocketsRequest, uWebSocketsRequestMocks] = useObjectMock<HttpRequest>(
+        requestMocks('post', '/path/to/route', ''),
+      );
+
+      const [uWebSocketsResponse, uWebSocketsResponseMocks] = useHttpResponseMock([
+        onAbortedMock(handlers, (): HttpResponse => uWebSocketsResponse),
+        onDataMock(handlers, (): HttpResponse => uWebSocketsResponse),
+        corkMock((): HttpResponse => uWebSocketsResponse),
+        { name: 'writeStatus', parameters: ['204 No Content'], returnSelf: true },
+        { name: 'endWithoutBody', parameters: [], returnSelf: true },
+      ]);
+
+      const { uriFactory, serverRequestFactory, requestHelpers, mocks } = useImplementationMocks({
+        url: 'http://127.0.0.1/path/to/route',
+        method: 'POST',
+        withBody: true,
+      });
+
+      const serverRequest = createUWebSocketsRequestToServerRequestFactory(
+        uriFactory,
+        serverRequestFactory,
+        requestHelpers,
+      )(uWebSocketsRequest, uWebSocketsResponse);
+
+      // a small body arrives after a response sent right away (e.g. a 204 without reading it)
+      createResponseToUWebSocketsResponseEmitter()(
+        createResponse({ status: 204, reasonPhrase: 'No Content' }),
+        uWebSocketsResponse,
+      );
+
+      handlers.data?.(toArrayBuffer('complete'), true);
+
+      // nothing more gets buffered: the body completes as usual instead of getting discarded
+      expect(await text(serverRequest.body)).toBe('complete');
+
+      expect(uWebSocketsRequestMocks).toHaveLength(0);
+      expect(uWebSocketsResponseMocks).toHaveLength(0);
+      expectAllMocksCalled(mocks);
+    });
+
+    test('with body, with body received before the response got sent', async () => {
+      const handlers: Handlers = {};
+
+      const [uWebSocketsRequest, uWebSocketsRequestMocks] = useObjectMock<HttpRequest>(
+        requestMocks('post', '/path/to/route', ''),
+      );
+
+      const [uWebSocketsResponse, uWebSocketsResponseMocks] = useHttpResponseMock([
+        onAbortedMock(handlers, (): HttpResponse => uWebSocketsResponse),
+        onDataMock(handlers, (): HttpResponse => uWebSocketsResponse),
+        corkMock((): HttpResponse => uWebSocketsResponse),
+        { name: 'writeStatus', parameters: ['204 No Content'], returnSelf: true },
+        { name: 'endWithoutBody', parameters: [], returnSelf: true },
+      ]);
+
+      const { uriFactory, serverRequestFactory, requestHelpers, mocks } = useImplementationMocks({
+        url: 'http://127.0.0.1/path/to/route',
+        method: 'POST',
+        withBody: true,
+      });
+
+      const serverRequest = createUWebSocketsRequestToServerRequestFactory(
+        uriFactory,
+        serverRequestFactory,
+        requestHelpers,
+      )(uWebSocketsRequest, uWebSocketsResponse);
+
+      handlers.data?.(toArrayBuffer('complete'), true);
+
+      createResponseToUWebSocketsResponseEmitter()(
+        createResponse({ status: 204, reasonPhrase: 'No Content' }),
+        uWebSocketsResponse,
+      );
+
+      // nothing got discarded: the fully received body is still readable
+      expect(await text(serverRequest.body)).toBe('complete');
+
+      expect(uWebSocketsRequestMocks).toHaveLength(0);
+      expect(uWebSocketsResponseMocks).toHaveLength(0);
+      expectAllMocksCalled(mocks);
+    });
+
     test.each([NaN, -1, -0.5, -Infinity])('with invalid request body max bytes %s', (requestBodyMaxBytes) => {
       const [uriFactory, uriFactoryMocks] = useFunctionMock<UriFactory>([]);
       const [serverRequestFactory, serverRequestFactoryMocks] = useFunctionMock<ServerRequestFactory>([]);
@@ -1621,6 +2053,81 @@ describe('uwebsockets', () => {
       await closed.promise;
 
       await wait(100);
+
+      expect(uWebSocketsResponseMocks).toHaveLength(0);
+    });
+
+    test.each([
+      // nothing has been sent yet, but the emitter already returned: the caller cannot respond anymore
+      ['collected', 0],
+      // an already started response cannot signal a failure anymore
+      ['streamed', 20],
+    ])('with %s body, closed before it ended', async (_, delay) => {
+      const handlers: Handlers = {};
+
+      const closed = Promise.withResolvers<undefined>();
+
+      const body = new Readable({ read() {} });
+      body.push('partial');
+
+      const [uWebSocketsResponse, uWebSocketsResponseMocks] = useHttpResponseMock([
+        onAbortedMock(handlers, (): HttpResponse => uWebSocketsResponse),
+        ...(delay > 0
+          ? [
+              corkMock((): HttpResponse => uWebSocketsResponse),
+              {
+                name: 'writeStatus',
+                parameters: ['200 OK'],
+                returnSelf: true,
+              } satisfies ObjectMocks<HttpResponse>[number],
+              writeMock('partial', true),
+            ]
+          : []),
+        {
+          name: 'close',
+          callback: (): HttpResponse => {
+            closed.resolve(undefined);
+
+            // uWebSockets.js calls the onAborted handler of a closed response
+            handlers.aborted?.();
+
+            return uWebSocketsResponse;
+          },
+        },
+      ]);
+
+      createResponseToUWebSocketsResponseEmitter(50)(createResponse({ body }), uWebSocketsResponse);
+
+      if (delay > 0) {
+        await wait(delay);
+      }
+
+      // destroyed without an error: it neither emits 'error' nor 'end', the response would never end
+      body.destroy();
+
+      // the response does not get ended as if it was complete: the connection gets closed, the response send timeout
+      // gets cleared (a second close call would fail with a missing mock)
+      await closed.promise;
+
+      await wait(100);
+
+      expect(uWebSocketsResponseMocks).toHaveLength(0);
+    });
+
+    test('with locked web stream body', () => {
+      const handlers: Handlers = {};
+
+      const body = new ReadableStream<Uint8Array>();
+      body.getReader();
+
+      // nothing gets written to the response (a call would fail with a missing mock)
+      const [uWebSocketsResponse, uWebSocketsResponseMocks] = useHttpResponseMock([
+        onAbortedMock(handlers, (): HttpResponse => uWebSocketsResponse),
+      ]);
+
+      expect(() => createResponseToUWebSocketsResponseEmitter()(createResponse({ body }), uWebSocketsResponse)).toThrow(
+        'Response body is locked',
+      );
 
       expect(uWebSocketsResponseMocks).toHaveLength(0);
     });

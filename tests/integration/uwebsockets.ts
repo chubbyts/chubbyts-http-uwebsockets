@@ -32,9 +32,28 @@ const responseFactory = createResponseFactory();
 const streamFactory = createStreamFactory();
 const responseHelpers = createResponseHelpers();
 
+// oxlint-disable-next-line functional/no-let
+let acceptedBody: Promise<string> = Promise.resolve('');
+
 const handler: Handler = async (serverRequest: ServerRequest): Promise<Response> => {
   if (serverRequest.uri.path === '/path/to/error/route') {
     throw new Error('Handler failure');
+  }
+
+  // responds before the body has been received, keeps on reading it
+  if (serverRequest.uri.path === '/path/to/accepted/route') {
+    acceptedBody = text(serverRequest.body).then((body) => `${body.length}`);
+
+    return responseFactory(202);
+  }
+
+  if (serverRequest.uri.path === '/path/to/accepted/result/route') {
+    return responseHelpers.withBody(responseFactory(200), streamFactory(await acceptedBody));
+  }
+
+  // responds without reading the body: the rest of the body gets discarded, the connection stays usable
+  if (serverRequest.uri.path === '/path/to/unauthorized/route') {
+    return responseHelpers.withBody(responseFactory(401), streamFactory('Unauthorized'));
   }
 
   // reflects client input into a header: must not allow response splitting
@@ -106,27 +125,23 @@ const responseToUWebSocketsResponseEmitter = createResponseToUWebSocketsResponse
 
 App()
   .any('/*', async (res: HttpResponse, req: HttpRequest) => {
-    // oxlint-disable-next-line functional/no-let
-    let serverRequest: ServerRequest | undefined = undefined;
-
     try {
-      serverRequest = uWebSocketsRequestToServerRequestFactory(req, res);
+      const serverRequest = uWebSocketsRequestToServerRequestFactory(req, res);
       const response = await handler(serverRequest);
       responseToUWebSocketsResponseEmitter(response, res);
     } catch (error) {
       console.error(`Failed to handle request: ${error}`);
 
-      // uWebSockets.js forbids touching an aborted response: if the client is already gone
-      // there is nothing left to send the error response to
-      if (serverRequest?.signal.aborted) {
-        return;
-      }
-
-      res.cork(() => {
-        res.writeStatus('500 Internal Server Error');
-        res.writeHeader('content-type', 'text/plain');
-        res.end('Internal Server Error');
-      });
+      // sent through the emitter as well: it does not touch an aborted response (uWebSockets.js forbids it) and
+      // takes care of a request body which has not been (fully) read
+      responseToUWebSocketsResponseEmitter(
+        responseHelpers.withHeader(
+          responseHelpers.withBody(responseFactory(500), streamFactory('Internal Server Error')),
+          'content-type',
+          'text/plain',
+        ),
+        res,
+      );
     }
   })
   .listen(serverHost, serverPort, (listenSocket: unknown) => {

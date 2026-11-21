@@ -42,30 +42,37 @@ const assertValidTimeoutMs = (name: string, timeoutMs: number | undefined): void
 // content-length), a larger one gets streamed
 const batchMaxBytes = 64 * 1024;
 
-// the emitter does not know the request: the request factory flags the responses of HEAD requests
-type AbortState = { aborted: boolean; head: boolean; readonly listeners: Array<() => void> };
+// the emitter does not know the request: the request factory flags the responses of HEAD requests and whether receiving
+// the request body has been paused (backpressure), the emitter flags the ended response
+type ResponseState = {
+  aborted: boolean;
+  head: boolean;
+  ended: boolean;
+  paused: boolean;
+  readonly listeners: Array<() => void>;
+};
 
 // uWebSockets.js creates a response per request and allows arbitrary user data to be attached to it: the state lives
 // on the response, a WeakMap keyed by the response would cost the garbage collector (ephemerons) a quarter of the
 // throughput. A symbol does not collide with the properties of the response or the ones of other user data.
-const abortStateKey = Symbol('@chubbyts/chubbyts-http-uwebsockets/abort-state');
+const responseStateKey = Symbol('@chubbyts/chubbyts-http-uwebsockets/response-state');
 
-type HttpResponseWithAbortState = HttpResponse & { [abortStateKey]?: AbortState };
+type HttpResponseWithResponseState = HttpResponse & { [responseStateKey]?: ResponseState };
 
 // uWebSockets.js supports only a single onAborted callback per response, but the request
 // factory and the response emitter both need to observe the abort: register it once and
 // fan out to all interested listeners
-const getAbortState = (uWebSocketsResponse: HttpResponseWithAbortState): AbortState => {
-  const existingState = uWebSocketsResponse[abortStateKey];
+const getResponseState = (uWebSocketsResponse: HttpResponseWithResponseState): ResponseState => {
+  const existingState = uWebSocketsResponse[responseStateKey];
 
   if (existingState) {
     return existingState;
   }
 
-  const state: AbortState = { aborted: false, head: false, listeners: [] };
+  const state: ResponseState = { aborted: false, head: false, ended: false, paused: false, listeners: [] };
 
   // oxlint-disable-next-line functional/immutable-data
-  uWebSocketsResponse[abortStateKey] = state;
+  uWebSocketsResponse[responseStateKey] = state;
 
   uWebSocketsResponse.onAborted(() => {
     // oxlint-disable-next-line functional/immutable-data
@@ -76,7 +83,7 @@ const getAbortState = (uWebSocketsResponse: HttpResponseWithAbortState): AbortSt
   return state;
 };
 
-const addAbortListener = (state: AbortState, listener: () => void): void => {
+const addAbortListener = (state: ResponseState, listener: () => void): void => {
   if (state.aborted) {
     listener();
 
@@ -85,6 +92,20 @@ const addAbortListener = (state: AbortState, listener: () => void): void => {
 
   // oxlint-disable-next-line functional/immutable-data
   state.listeners.push(listener);
+};
+
+// called right before ending the response: uWebSockets.js forbids touching an ended response, it keeps on receiving a
+// request body not (fully) received yet to keep the connection alive (the request factory discards it, unless it is
+// still being read). Receiving paused on backpressure has to be resumed, the connection would hang otherwise.
+const prepareEnd = (uWebSocketsResponse: HttpResponse, state: ResponseState): void => {
+  // oxlint-disable-next-line functional/immutable-data
+  state.ended = true;
+
+  if (state.paused) {
+    // oxlint-disable-next-line functional/immutable-data
+    state.paused = false;
+    uWebSocketsResponse.resume();
+  }
 };
 
 const resolveUrl = (pathAndQuery: string, origin: string, basePath: string): string => {
@@ -96,6 +117,11 @@ const resolveUrl = (pathAndQuery: string, origin: string, basePath: string): str
     throw new Error(
       `Request target "${pathAndQuery}" resolves to origin "${url.origin}" instead of the expected origin "${origin}"`,
     );
+  }
+
+  // same-origin protocol-relative targets ('//user@example.com/path') keep the origin but inject userinfo
+  if (url.username !== '' || url.password !== '') {
+    throw new Error(`Request target "${pathAndQuery}" must not contain userinfo`);
   }
 
   return url.href;
@@ -181,24 +207,21 @@ const uWebSocketsRequestToHeaders = (uWebSocketsRequest: HttpRequest): Record<st
 
 const getBody = (
   uWebSocketsResponse: HttpResponse,
-  abortState: AbortState,
+  responseState: ResponseState,
   contentLength: string | undefined,
   requestBodyTimeoutMs: number | undefined,
   requestBodyMaxBytes: number | undefined,
 ): Body => {
-  const received: { bytes: number; paused: boolean; timeout: NodeJS.Timeout | undefined } = {
-    bytes: 0,
-    paused: false,
-    timeout: undefined,
-  };
+  const received: { bytes: number; timeout: NodeJS.Timeout | undefined } = { bytes: 0, timeout: undefined };
 
   // a readable fed by onData instead of a passthrough: a passthrough is a writable and a readable, each chunk passes
-  // both sides. Reading the body resumes the receiving paused on backpressure.
+  // both sides. Reading the body resumes the receiving paused on backpressure (kept within the state of the response,
+  // the emitter has to resume it before ending the response).
   const body = new Readable({
     read: () => {
-      if (received.paused) {
+      if (responseState.paused) {
         // oxlint-disable-next-line functional/immutable-data
-        received.paused = false;
+        responseState.paused = false;
         uWebSocketsResponse.resume();
       }
     },
@@ -210,17 +233,17 @@ const getBody = (
 
   // a disconnecting client would otherwise leave the body open forever: a pending
   // read of the request body has to fail instead of hanging
-  addAbortListener(abortState, () => {
+  addAbortListener(responseState, () => {
     clearTimeout(received.timeout);
     body.destroy(new Error('Request has been aborted'));
   });
 
   // the error reaches the handler while iterating the body, the connection gets closed as the client would
-  // otherwise keep on sending the body
+  // otherwise keep on sending the body (uWebSockets.js forbids touching an aborted or ended response)
   const failBody = (error: Error): void => {
     body.destroy(error);
 
-    if (!abortState.aborted) {
+    if (!responseState.aborted && !responseState.ended) {
       uWebSocketsResponse.close();
     }
   };
@@ -248,6 +271,26 @@ const getBody = (
       : undefined;
 
   uWebSocketsResponse.onData((chunk: ArrayBuffer, isLast: boolean) => {
+    // the response has been sent before the body has been fully received: uWebSockets.js keeps on receiving it to keep
+    // the connection alive, but forbids touching the response (pausing / closing it)
+    if (responseState.ended) {
+      // already failed (e.g. too large) or discarded: nothing left to do
+      if (body.destroyed) {
+        return;
+      }
+
+      // nobody reads the body (e.g. a 401 without reading it): the rest gets discarded instead of being buffered, a
+      // handler reading it later on gets an error instead of a truncated body. A handler still reading it (e.g. having
+      // responded with a 202 already) keeps on getting it, without backpressure. The last chunk completes the body as
+      // usual: nothing more gets buffered (a small body arrives after a response sent right away, no error per request).
+      if (!isLast && body.readableFlowing === null && !body.readableDidRead) {
+        clearTimeout(received.timeout);
+        body.destroy(new Error('Request body has been discarded, the response has been sent without reading it'));
+
+        return;
+      }
+    }
+
     // oxlint-disable-next-line functional/immutable-data
     received.bytes += chunk.byteLength;
 
@@ -260,11 +303,12 @@ const getBody = (
     }
 
     // uWebSockets.js reuses the chunk memory after the callback: copy it; push returns false on backpressure:
-    // pause receiving until the handler consumed the buffered data, otherwise a fast client could fill the memory
+    // pause receiving until the handler consumed the buffered data, otherwise a fast client could fill the memory (an
+    // ended response cannot be paused anymore, the request body max bytes still limits the buffered data)
     // oxlint-disable-next-line functional/immutable-data
-    if (!body.push(Buffer.from(new Uint8Array(chunk))) && !isLast) {
+    if (!body.push(Buffer.from(new Uint8Array(chunk))) && !isLast && !responseState.ended) {
       // oxlint-disable-next-line functional/immutable-data
-      received.paused = true;
+      responseState.paused = true;
       uWebSocketsResponse.pause();
     }
 
@@ -311,16 +355,16 @@ export const createUWebSocketsRequestToServerRequestFactory = (
     const headers = uWebSocketsRequestToHeaders(uWebSocketsRequest);
     const uri = uriFactory(resolveRequestUrl(uWebSocketsRequest));
 
-    const abortState = getAbortState(uWebSocketsResponse);
+    const responseState = getResponseState(uWebSocketsResponse);
 
     if (method === 'HEAD') {
       // oxlint-disable-next-line functional/immutable-data
-      abortState.head = true;
+      responseState.head = true;
     }
 
     const abortController = new AbortController();
 
-    addAbortListener(abortState, () => {
+    addAbortListener(responseState, () => {
       abortController.abort();
     });
 
@@ -345,7 +389,7 @@ export const createUWebSocketsRequestToServerRequestFactory = (
       serverRequest,
       getBody(
         uWebSocketsResponse,
-        abortState,
+        responseState,
         headers['content-length']?.[0],
         requestBodyTimeoutMs,
         requestBodyMaxBytes,
@@ -410,8 +454,8 @@ const getInvalidResponseReason = (response: Response): string | undefined => {
 
 // RFC 9112 6.3: the response to a HEAD request and a 1xx, 204 or 304 response end with the header section, any byte
 // sent as body would be read as the start of the next response
-const hasNoContent = (response: Response, abortState: AbortState): boolean =>
-  abortState.head || response.status < 200 || response.status === 204 || response.status === 304;
+const hasNoContent = (response: Response, responseState: ResponseState): boolean =>
+  responseState.head || response.status < 200 || response.status === 204 || response.status === 304;
 
 // RFC 9110 8.6: a 1xx or 204 response must not have a content-length, a HEAD or 304 response may announce the one of
 // the GET response, which is taken from the handler if it is a single valid one
@@ -458,7 +502,7 @@ const sendBody = (
   response: Response,
   body: Readable,
   uWebSocketsResponse: HttpResponse,
-  abortState: AbortState,
+  responseState: ResponseState,
   responseSendTimeoutMs: number | undefined,
 ): void => {
   // the collected chunks, until the streaming started
@@ -506,7 +550,7 @@ const sendBody = (
 
   // a disconnecting client must stop the streaming: the body gets destroyed, uWebSockets.js forbids touching the
   // aborted response (cleared here as well, a body may destroy itself without emitting the error)
-  addAbortListener(abortState, () => {
+  addAbortListener(responseState, () => {
     clearImmediate(immediate);
     clearTimeout(state.timeout);
     body.destroy(new Error('Response has been aborted'));
@@ -533,10 +577,14 @@ const sendBody = (
     }
   });
 
-  // the response cannot signal a failure (anymore): close the connection instead of ending the response as if it was
-  // complete, close() triggers the abort listener, which clears the immediate and the timeout
-  body.on('error', () => {
-    if (!abortState.aborted) {
+  // the error does not surface as an unhandled 'error' event, the close listener handles it
+  body.on('error', noop);
+
+  // the response cannot signal a failure (anymore): a body failing or closed before it ended (destroyed without an
+  // error, it would never end) closes the connection instead of ending the response as if it was complete, close()
+  // triggers the abort listener, which clears the immediate and the timeout
+  body.on('close', () => {
+    if (!body.readableEnded && !responseState.aborted) {
       uWebSocketsResponse.close();
     }
   });
@@ -549,12 +597,14 @@ const sendBody = (
 
     uWebSocketsResponse.cork(() => {
       if (chunks === undefined) {
+        prepareEnd(uWebSocketsResponse, responseState);
         uWebSocketsResponse.end();
 
         return;
       }
 
       writeStatusAndHeaders(response, uWebSocketsResponse);
+      prepareEnd(uWebSocketsResponse, responseState);
 
       // the whole body at once: uWebSockets.js adds the content-length
       // Stryker disable next-line ConditionalExpression: concatenating a single chunk results in the same, only slower
@@ -571,11 +621,11 @@ export const createResponseToUWebSocketsResponseEmitter = (
   assertValidTimeoutMs('Response send timeout ms', responseSendTimeoutMs);
 
   return (response: Response, uWebSocketsResponse: HttpResponse): void => {
-    const abortState = getAbortState(uWebSocketsResponse);
+    const responseState = getResponseState(uWebSocketsResponse);
 
     // the client may already be gone (uWebSockets.js forbids touching an aborted response):
     // cancel the potentially connection-backed body, nothing can be sent to the client anymore
-    if (abortState.aborted) {
+    if (responseState.aborted) {
       cancelBody(response.body);
 
       return;
@@ -591,13 +641,14 @@ export const createResponseToUWebSocketsResponseEmitter = (
     }
 
     // the body (e.g. of a GET handler also serving HEAD) does not get sent: cancel it like an unsent one
-    if (hasNoContent(response, abortState)) {
+    if (hasNoContent(response, responseState)) {
       cancelBody(response.body);
 
       const reportedContentLength = getReportedContentLength(response);
 
       uWebSocketsResponse.cork(() => {
         writeStatusAndHeaders(response, uWebSocketsResponse);
+        prepareEnd(uWebSocketsResponse, responseState);
 
         // an explicit undefined would make uWebSockets.js report a content-length of 2^63
         if (reportedContentLength !== undefined) {
@@ -618,10 +669,16 @@ export const createResponseToUWebSocketsResponseEmitter = (
 
       uWebSocketsResponse.cork(() => {
         writeStatusAndHeaders(response, uWebSocketsResponse);
+        prepareEnd(uWebSocketsResponse, responseState);
         uWebSocketsResponse.end();
       });
 
       return;
+    }
+
+    // a locked web stream cannot be converted with Readable.fromWeb: thrown before anything has been written
+    if (response.body instanceof ReadableStream && response.body.locked) {
+      throw new Error('Response body is locked');
     }
 
     const body = bodyToReadable(response.body);
@@ -635,12 +692,13 @@ export const createResponseToUWebSocketsResponseEmitter = (
     if (body.readableEnded) {
       uWebSocketsResponse.cork(() => {
         writeStatusAndHeaders(response, uWebSocketsResponse);
+        prepareEnd(uWebSocketsResponse, responseState);
         uWebSocketsResponse.end();
       });
 
       return;
     }
 
-    sendBody(response, body, uWebSocketsResponse, abortState, responseSendTimeoutMs);
+    sendBody(response, body, uWebSocketsResponse, responseState, responseSendTimeoutMs);
   };
 };

@@ -37,7 +37,7 @@ injected `UriFactory`, `ServerRequestFactory` and `RequestHelpers` (or `ServerRe
 Through [NPM](https://www.npmjs.com) as [@chubbyts/chubbyts-http-uwebsockets][1].
 
 ```sh
-npm i @chubbyts/chubbyts-http-uwebsockets@^1.1.2
+npm i @chubbyts/chubbyts-http-uwebsockets@^1.2.0
 ```
 
 ## Usage
@@ -46,9 +46,13 @@ npm i @chubbyts/chubbyts-http-uwebsockets@^1.1.2
 import type { HttpRequest, HttpResponse } from 'uWebSockets.js';
 import { App } from 'uWebSockets.js';
 import type { Handler } from '@chubbyts/chubbyts-http-types/handler';
-import type { ServerRequest } from '@chubbyts/chubbyts-http-types/message';
-import { createServerRequestFactory, createUriFactory } from '@chubbyts/chubbyts-http/message-factory';
-import { createServerRequestHelpers } from '@chubbyts/chubbyts-http/message-helper';
+import {
+  createResponseFactory,
+  createServerRequestFactory,
+  createStreamFactory,
+  createUriFactory,
+} from '@chubbyts/chubbyts-http/message-factory';
+import { createResponseHelpers, createServerRequestHelpers } from '@chubbyts/chubbyts-http/message-helper';
 import {
   createResponseToUWebSocketsResponseEmitter,
   createUWebSocketsRequestToServerRequestFactory,
@@ -76,29 +80,30 @@ declare const handler: Handler;
 // argument (optional): the response must be fully sent within 60s
 const responseToUWebSocketsResponseEmitter = createResponseToUWebSocketsResponseEmitter(60_000);
 
+const responseFactory = createResponseFactory();
+const streamFactory = createStreamFactory();
+const responseHelpers = createResponseHelpers();
+
 App()
   .any('/*', async (res: HttpResponse, req: HttpRequest) => {
-    let serverRequest: ServerRequest | undefined = undefined;
-
     try {
       // has to be called synchronously: uWebSockets.js invalidates the request after the first await
-      serverRequest = uWebSocketsRequestToServerRequestFactory(req, res);
+      const serverRequest = uWebSocketsRequestToServerRequestFactory(req, res);
       const response = await handler(serverRequest);
       responseToUWebSocketsResponseEmitter(response, res);
     } catch (error) {
       console.error(`Failed to handle request: ${error}`);
 
-      // uWebSockets.js forbids touching an aborted response: if the client is already gone
-      // there is nothing left to send the error response to
-      if (serverRequest?.signal.aborted) {
-        return;
-      }
-
-      res.cork(() => {
-        res.writeStatus('500 Internal Server Error');
-        res.writeHeader('content-type', 'text/plain');
-        res.end('Internal Server Error');
-      });
+      // sent through the emitter as well: it does not touch an aborted response (uWebSockets.js forbids it) and
+      // takes care of a request body which has not been (fully) read
+      responseToUWebSocketsResponseEmitter(
+        responseHelpers.withHeader(
+          responseHelpers.withBody(responseFactory(500), streamFactory('Internal Server Error')),
+          'content-type',
+          'text/plain',
+        ),
+        res,
+      );
     }
   })
   .listen(serverHost, serverPort, (listenSocket: unknown) => {
@@ -115,7 +120,8 @@ The server request gets created by `serverRequestFactory(method, uriFactory(url)
 provide the optional `withHeaders`) and, except for `GET` and `HEAD`, `withBody` get applied:
 
  * the url gets built from the base url (scheme, host, port and path prefix) and the origin-form request target.
-   Request targets in another form get rejected.
+   Request targets in another form get rejected, as well as ones resolving to another origin (`//evil.com/path`) or
+   injecting userinfo (`//user@example.com/path`).
  * `headers` keep every value of a repeated header (e.g. `cookie`), multiple `authorization` or
    `proxy-authorization` headers get rejected.
  * `protocolVersion` is always `1.1`, uWebSockets.js does not expose the http version.
@@ -124,13 +130,29 @@ provide the optional `withHeaders`) and, except for `GET` and `HEAD`, `withBody`
    cannot fill the memory.
  * `signal` gets aborted when the client disconnects (`onAborted`).
 
+A response may be sent before the request body has been (fully) received. uWebSockets.js keeps on receiving the rest
+of the body to keep the connection alive, but forbids touching the ended response: receiving paused on backpressure
+gets resumed right before the response gets ended (the connection would hang otherwise), afterwards it cannot be
+paused anymore.
+
+ * a body nobody reads (e.g. a `401` without reading it) gets discarded instead of being buffered, reading it later on
+   fails with an error instead of returning a truncated body.
+ * a body still being read (e.g. having responded with a `202` already) keeps on being received, without backpressure:
+   the request body max bytes still limits it (failing the body instead of closing the connection).
+
+This only works for responses sent through the emitter, which is why the usage example sends the error response
+through it as well.
+
 ### Response
 
 The status, the reason phrase and the headers get validated before anything is written: a status outside of
 `100`-`999`, a header name which is not a token or a reason phrase / header value containing control characters
 (e.g. CR / LF, which would allow response splitting) lets the emitter throw, after cancelling the body. The same
-applies to an already destroyed node stream body. As nothing has been sent yet, the caller is able to respond with an
-error (see the usage example).
+applies to an already destroyed node stream body and to a locked web stream body. As nothing has been sent yet, the
+caller is able to respond with an error (see the usage example).
+
+A body failing, or getting closed before it ended (destroyed without an error), closes the connection: the response
+cannot signal the failure (anymore), the client must not take a truncated body for a complete one.
 
 uWebSockets.js frames the response itself: `content-length` and `transfer-encoding` headers set by the handler do
 not get written, they would end up duplicated or conflicting (`content-length` next to `chunked`), which lets a proxy

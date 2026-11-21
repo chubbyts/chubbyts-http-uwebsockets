@@ -4,7 +4,7 @@ import { expect, test } from 'vitest';
 
 // pipelined requests on one connection, the raw response bytes (without the date header): a wrongly framed response
 // shows up as garbage before the next response
-const rawRequests = (requests: ReadonlyArray<string>): Promise<string> => {
+const rawRequests = (requests: ReadonlyArray<string | { request: string; body: string }>): Promise<string> => {
   const { hostname, port } = new URL(process.env.HTTP_URI as string);
 
   return new Promise((resolve, reject) => {
@@ -13,10 +13,16 @@ const rawRequests = (requests: ReadonlyArray<string>): Promise<string> => {
     const socket = connect(Number(port), hostname, () => {
       socket.end(
         requests
-          .map(
-            (request, i) =>
-              `${request} HTTP/1.1\r\nHost: ${hostname}\r\n${i === requests.length - 1 ? 'Connection: close\r\n' : ''}\r\n`,
-          )
+          .map((request, i) => {
+            const { request: requestLine, body } = typeof request === 'string' ? { request, body: '' } : request;
+
+            return (
+              `${requestLine} HTTP/1.1\r\nHost: ${hostname}\r\n` +
+              (body ? `Content-Length: ${body.length}\r\n` : '') +
+              (i === requests.length - 1 ? 'Connection: close\r\n' : '') +
+              `\r\n${body}`
+            );
+          })
           .join(''),
       );
     });
@@ -212,5 +218,58 @@ test('not modified, with body set by the handler', async () => {
       'x-echo: next\r\n' +
       'uWebSockets: 20\r\n' +
       '\r\n',
+  );
+});
+
+test.each([
+  [
+    '/path/to/unauthorized/route',
+    'HTTP/1.1 401 Unauthorized\r\nuWebSockets: 20\r\nContent-Length: 12\r\n\r\nUnauthorized',
+  ],
+  [
+    '/path/to/error/route',
+    'HTTP/1.1 500 Internal Server Error\r\n' +
+      'content-type: text/plain\r\n' +
+      'uWebSockets: 20\r\n' +
+      'Content-Length: 21\r\n' +
+      '\r\n' +
+      'Internal Server Error',
+  ],
+])(
+  'post %s, responding without reading the body, followed by another request on the same connection',
+  async (path, expected) => {
+    // the body exceeds the buffer of the request body: receiving it gets paused, it has to be resumed when the response
+    // gets sent, the rest gets discarded (the server must neither hang nor crash)
+    expect(
+      await rawRequests([
+        { request: `POST ${path}`, body: 'a'.repeat(512 * 1024) },
+        'GET /path/to/echo/route?echo=next',
+      ]),
+    ).toBe(`${expected}HTTP/1.1 204 No Content\r\nx-echo: next\r\nuWebSockets: 20\r\n\r\n`);
+  },
+);
+
+test('get, with userinfo injected by a protocol-relative request target', async () => {
+  expect(await rawRequests(['GET //user:password@example.com/path/to/route'])).toBe(
+    'HTTP/1.1 500 Internal Server Error\r\n' +
+      'content-type: text/plain\r\n' +
+      'uWebSockets: 20\r\n' +
+      'Content-Length: 21\r\n' +
+      '\r\n' +
+      'Internal Server Error',
+  );
+});
+
+test('post, responding before the body got received, still reading it, followed by another request on the same connection', async () => {
+  // the body exceeds the buffer of the request body: receiving it gets paused, it gets resumed when the response gets
+  // sent, the handler still reading it gets the whole body
+  expect(
+    await rawRequests([
+      { request: 'POST /path/to/accepted/route', body: 'a'.repeat(512 * 1024) },
+      'GET /path/to/accepted/result/route',
+    ]),
+  ).toBe(
+    'HTTP/1.1 202 Accepted\r\nuWebSockets: 20\r\nContent-Length: 0\r\n\r\n' +
+      `HTTP/1.1 200 OK\r\nuWebSockets: 20\r\nContent-Length: 6\r\n\r\n${512 * 1024}`,
   );
 });

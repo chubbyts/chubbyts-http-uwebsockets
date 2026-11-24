@@ -37,7 +37,7 @@ injected `UriFactory`, `ServerRequestFactory` and `RequestHelpers` (or `ServerRe
 Through [NPM](https://www.npmjs.com) as [@chubbyts/chubbyts-http-uwebsockets][1].
 
 ```sh
-npm i @chubbyts/chubbyts-http-uwebsockets@^1.2.1
+npm i @chubbyts/chubbyts-http-uwebsockets@^1.2.2
 ```
 
 ## Usage
